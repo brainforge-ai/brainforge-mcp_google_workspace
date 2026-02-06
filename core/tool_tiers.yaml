@@ -85,6 +85,7 @@ sheets:
   extended:
     - list_spreadsheets
     - get_spreadsheet_info
+    - format_sheet_range
   complete:
     - create_sheet
     - read_spreadsheet_comments

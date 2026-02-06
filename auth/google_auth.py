@@ -93,13 +93,14 @@ else:
 
 def _find_any_credentials(
     base_dir: str = DEFAULT_CREDENTIALS_DIR,
-) -> Optional[Credentials]:
+) -> tuple[Optional[Credentials], Optional[str]]:
     """
     Find and load any valid credentials from the credentials directory.
     Used in single-user mode to bypass session-to-OAuth mapping.
 
     Returns:
-        First valid Credentials object found, or None if none exist.
+        Tuple of (Credentials, user_email) or (None, None) if none exist.
+        Returns the user email to enable saving refreshed credentials.
     """
     try:
         store = get_credential_store()
@@ -108,7 +109,7 @@ def _find_any_credentials(
             logger.info(
                 "[single-user] No users found with credentials via credential store"
             )
-            return None
+            return None, None
 
         # Return credentials for the first user found
         first_user = users[0]
@@ -117,7 +118,7 @@ def _find_any_credentials(
             logger.info(
                 f"[single-user] Found credentials for {first_user} via credential store"
             )
-            return credentials
+            return credentials, first_user
         else:
             logger.warning(
                 f"[single-user] Could not load credentials for {first_user} via credential store"
@@ -129,7 +130,7 @@ def _find_any_credentials(
         )
 
     logger.info("[single-user] No valid credentials found via credential store")
-    return None
+    return None, None
 
 
 def save_credentials_to_session(session_id: str, credentials: Credentials):
@@ -620,27 +621,20 @@ def get_credentials(
         logger.info(
             "[get_credentials] Single-user mode: bypassing session mapping, finding any credentials"
         )
-        credentials = _find_any_credentials(credentials_base_dir)
+        credentials, found_user_email = _find_any_credentials(credentials_base_dir)
         if not credentials:
             logger.info(
                 f"[get_credentials] Single-user mode: No credentials found in {credentials_base_dir}"
             )
             return None
 
-        # In single-user mode, if user_google_email wasn't provided, try to get it from user info
-        # This is needed for proper credential saving after refresh
-        if not user_google_email and credentials.valid:
-            try:
-                user_info = get_user_info(credentials)
-                if user_info and "email" in user_info:
-                    user_google_email = user_info["email"]
-                    logger.debug(
-                        f"[get_credentials] Single-user mode: extracted user email {user_google_email} from credentials"
-                    )
-            except Exception as e:
-                logger.debug(
-                    f"[get_credentials] Single-user mode: could not extract user email: {e}"
-                )
+        # Use the email from the credential file if not provided
+        # This ensures we can save refreshed credentials even when the token is expired
+        if not user_google_email and found_user_email:
+            user_google_email = found_user_email
+            logger.debug(
+                f"[get_credentials] Single-user mode: using email {user_google_email} from credential file"
+            )
     else:
         credentials: Optional[Credentials] = None
 

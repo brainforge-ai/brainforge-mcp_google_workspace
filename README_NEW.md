@@ -121,8 +121,8 @@ export OAUTHLIB_INSECURE_TRANSPORT=1  # Development only
 | `create_spreadsheet` | Core | Create new spreadsheets with multiple sheets |
 | `list_spreadsheets` | Extended | List accessible spreadsheets |
 | `get_spreadsheet_info` | Extended | Get metadata, sheets, conditional formats |
+| `format_sheet_range` | Extended | Apply colors, number formats, text wrapping, alignment, bold/italic, font size |
 | `create_sheet` | Complete | Add sheets to existing spreadsheets |
-| `format_sheet_range` | Complete | Apply colors and number formats |
 | `add_conditional_formatting` | Complete | Add boolean or gradient rules |
 | `update_conditional_formatting` | Complete | Modify existing rules |
 | `delete_conditional_formatting` | Complete | Remove formatting rules |

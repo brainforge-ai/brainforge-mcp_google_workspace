@@ -376,9 +376,9 @@ async def get_events(
     if event_id:
         logger.info(f"[get_events] Retrieving single event with ID: {event_id}")
         event = await asyncio.to_thread(
-            lambda: service.events()
-            .get(calendarId=calendar_id, eventId=event_id)
-            .execute()
+            lambda: (
+                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+            )
         )
         items = [event]
     else:
@@ -701,13 +701,15 @@ async def create_event(
                     if drive_service:
                         try:
                             file_metadata = await asyncio.to_thread(
-                                lambda: drive_service.files()
-                                .get(
-                                    fileId=file_id,
-                                    fields="mimeType,name",
-                                    supportsAllDrives=True,
+                                lambda: (
+                                    drive_service.files()
+                                    .get(
+                                        fileId=file_id,
+                                        fields="mimeType,name",
+                                        supportsAllDrives=True,
+                                    )
+                                    .execute()
                                 )
-                                .execute()
                             )
                             mime_type = file_metadata.get("mimeType", mime_type)
                             filename = file_metadata.get("name")
@@ -735,24 +737,28 @@ async def create_event(
             if drive_service:
                 drive_service.close()
         created_event = await asyncio.to_thread(
-            lambda: service.events()
-            .insert(
-                calendarId=calendar_id,
-                body=event_body,
-                supportsAttachments=True,
-                conferenceDataVersion=1 if add_google_meet else 0,
+            lambda: (
+                service.events()
+                .insert(
+                    calendarId=calendar_id,
+                    body=event_body,
+                    supportsAttachments=True,
+                    conferenceDataVersion=1 if add_google_meet else 0,
+                )
+                .execute()
             )
-            .execute()
         )
     else:
         created_event = await asyncio.to_thread(
-            lambda: service.events()
-            .insert(
-                calendarId=calendar_id,
-                body=event_body,
-                conferenceDataVersion=1 if add_google_meet else 0,
+            lambda: (
+                service.events()
+                .insert(
+                    calendarId=calendar_id,
+                    body=event_body,
+                    conferenceDataVersion=1 if add_google_meet else 0,
+                )
+                .execute()
             )
-            .execute()
         )
     link = created_event.get("htmlLink", "No link available")
     confirmation_message = f"Successfully created event '{created_event.get('summary', summary)}' for {user_google_email}. Link: {link}"
@@ -976,9 +982,9 @@ async def modify_event(
     # Get the existing event to preserve fields that aren't being updated
     try:
         existing_event = await asyncio.to_thread(
-            lambda: service.events()
-            .get(calendarId=calendar_id, eventId=event_id)
-            .execute()
+            lambda: (
+                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+            )
         )
         logger.info(
             "[modify_event] Successfully retrieved existing event before update"
@@ -1035,14 +1041,16 @@ async def modify_event(
 
     # Proceed with the update
     updated_event = await asyncio.to_thread(
-        lambda: service.events()
-        .update(
-            calendarId=calendar_id,
-            eventId=event_id,
-            body=event_body,
-            conferenceDataVersion=1,
+        lambda: (
+            service.events()
+            .update(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body=event_body,
+                conferenceDataVersion=1,
+            )
+            .execute()
         )
-        .execute()
     )
 
     link = updated_event.get("htmlLink", "No link available")
@@ -1096,9 +1104,9 @@ async def delete_event(
     # Try to get the event first to verify it exists
     try:
         await asyncio.to_thread(
-            lambda: service.events()
-            .get(calendarId=calendar_id, eventId=event_id)
-            .execute()
+            lambda: (
+                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+            )
         )
         logger.info("[delete_event] Successfully verified event exists before deletion")
     except HttpError as get_error:
@@ -1115,9 +1123,9 @@ async def delete_event(
 
     # Proceed with the deletion
     await asyncio.to_thread(
-        lambda: service.events()
-        .delete(calendarId=calendar_id, eventId=event_id)
-        .execute()
+        lambda: (
+            service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        )
     )
 
     confirmation_message = f"Successfully deleted event (ID: {event_id}) from calendar '{calendar_id}' for {user_google_email}."

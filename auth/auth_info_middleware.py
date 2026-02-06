@@ -2,7 +2,6 @@
 Authentication middleware to populate context state with user information
 """
 
-import jwt
 import logging
 import time
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -187,90 +186,11 @@ class AuthInfoMiddleware(Middleware):
                                 )
 
                         else:
-                            # Decode JWT to get user info
-                            logger.info("Processing JWT token")
-                            try:
-                                token_payload = jwt.decode(
-                                    token_str, options={"verify_signature": False}
-                                )
-                                logger.info(
-                                    f"JWT payload decoded: {list(token_payload.keys())}"
-                                )
-
-                                # Create an AccessToken-like object
-                                access_token = WorkspaceAccessToken(
-                                    token=token_str,
-                                    client_id=token_payload.get("client_id", "unknown"),
-                                    scopes=token_payload.get("scope", "").split()
-                                    if token_payload.get("scope")
-                                    else [],
-                                    session_id=token_payload.get(
-                                        "sid",
-                                        token_payload.get(
-                                            "jti",
-                                            token_payload.get("session_id", "unknown"),
-                                        ),
-                                    ),
-                                    expires_at=token_payload.get("exp", 0),
-                                    claims=token_payload,
-                                    sub=token_payload.get("sub"),
-                                    email=token_payload.get("email"),
-                                )
-
-                                # Store in context state
-                                context.fastmcp_context.set_state(
-                                    "access_token", access_token
-                                )
-
-                                # Store additional user info
-                                context.fastmcp_context.set_state(
-                                    "user_id", token_payload.get("sub")
-                                )
-                                context.fastmcp_context.set_state(
-                                    "username",
-                                    token_payload.get(
-                                        "username", token_payload.get("email")
-                                    ),
-                                )
-                                context.fastmcp_context.set_state(
-                                    "name", token_payload.get("name")
-                                )
-                                context.fastmcp_context.set_state(
-                                    "auth_time", token_payload.get("auth_time")
-                                )
-                                context.fastmcp_context.set_state(
-                                    "issuer", token_payload.get("iss")
-                                )
-                                context.fastmcp_context.set_state(
-                                    "audience", token_payload.get("aud")
-                                )
-                                context.fastmcp_context.set_state(
-                                    "jti", token_payload.get("jti")
-                                )
-                                context.fastmcp_context.set_state(
-                                    "auth_provider_type", self.auth_provider_type
-                                )
-
-                                # Set the definitive authentication state for JWT tokens
-                                user_email = token_payload.get(
-                                    "email", token_payload.get("username")
-                                )
-                                if user_email:
-                                    context.fastmcp_context.set_state(
-                                        "authenticated_user_email", user_email
-                                    )
-                                    context.fastmcp_context.set_state(
-                                        "authenticated_via", "jwt_token"
-                                    )
-                                    authenticated_user = user_email
-                                    auth_via = "jwt_token"
-
-                            except jwt.DecodeError:
-                                logger.error("Failed to decode JWT token")
-                            except Exception as e:
-                                logger.error(
-                                    f"Error processing JWT: {type(e).__name__}"
-                                )
+                            # Non-Google JWT tokens require verification
+                            # SECURITY: Never set authenticated_user_email from unverified tokens
+                            logger.debug(
+                                "Unverified JWT token rejected - only verified tokens accepted"
+                            )
                     else:
                         logger.debug("No Bearer token in Authorization header")
                 else:

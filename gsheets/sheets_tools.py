@@ -365,54 +365,71 @@ async def modify_sheet_values(
     return text_output
 
 
-@server.tool()
-@handle_http_errors("format_sheet_range", service_type="sheets")
-@require_google_service("sheets", "sheets_write")
-async def format_sheet_range(
+# Internal implementation function for testing
+async def _format_sheet_range_impl(
     service,
-    user_google_email: str,
     spreadsheet_id: str,
     range_name: str,
     background_color: Optional[str] = None,
     text_color: Optional[str] = None,
     number_format_type: Optional[str] = None,
     number_format_pattern: Optional[str] = None,
+    wrap_strategy: Optional[str] = None,
+    horizontal_alignment: Optional[str] = None,
+    vertical_alignment: Optional[str] = None,
+    bold: Optional[bool] = None,
+    italic: Optional[bool] = None,
+    font_size: Optional[int] = None,
 ) -> str:
-    """
-    Applies formatting to a range: background/text color and number/date formats.
+    """Internal implementation for format_sheet_range.
 
-    Colors accept hex strings (#RRGGBB). Number formats follow Sheets types
-    (e.g., NUMBER, NUMBER_WITH_GROUPING, CURRENCY, DATE, TIME, DATE_TIME,
-    PERCENT, TEXT, SCIENTIFIC). If no sheet name is provided, the first sheet
-    is used.
+    Applies formatting to a Google Sheets range including colors, number formats,
+    text wrapping, alignment, and text styling.
 
     Args:
-        user_google_email (str): The user's Google email address. Required.
-        spreadsheet_id (str): The ID of the spreadsheet. Required.
-        range_name (str): A1-style range (optionally with sheet name). Required.
-        background_color (Optional[str]): Hex background color (e.g., "#FFEECC").
-        text_color (Optional[str]): Hex text color (e.g., "#000000").
-        number_format_type (Optional[str]): Sheets number format type (e.g., "DATE").
-        number_format_pattern (Optional[str]): Optional custom pattern for the number format.
+        service: Google Sheets API service client.
+        spreadsheet_id: The ID of the spreadsheet.
+        range_name: A1-style range (optionally with sheet name).
+        background_color: Hex background color (e.g., "#FFEECC").
+        text_color: Hex text color (e.g., "#000000").
+        number_format_type: Sheets number format type (e.g., "DATE").
+        number_format_pattern: Optional custom pattern for the number format.
+        wrap_strategy: Text wrap strategy (WRAP, CLIP, OVERFLOW_CELL).
+        horizontal_alignment: Horizontal alignment (LEFT, CENTER, RIGHT).
+        vertical_alignment: Vertical alignment (TOP, MIDDLE, BOTTOM).
+        bold: Whether to apply bold formatting.
+        italic: Whether to apply italic formatting.
+        font_size: Font size in points.
 
     Returns:
-        str: Confirmation of the applied formatting.
+        Dictionary with keys: range_name, spreadsheet_id, summary.
     """
-    logger.info(
-        "[format_sheet_range] Invoked. Email: '%s', Spreadsheet: %s, Range: %s",
-        user_google_email,
-        spreadsheet_id,
-        range_name,
+    # Validate at least one formatting option is provided
+    has_any_format = any(
+        [
+            background_color,
+            text_color,
+            number_format_type,
+            wrap_strategy,
+            horizontal_alignment,
+            vertical_alignment,
+            bold is not None,
+            italic is not None,
+            font_size is not None,
+        ]
     )
-
-    if not any([background_color, text_color, number_format_type]):
+    if not has_any_format:
         raise UserInputError(
-            "Provide at least one of background_color, text_color, or number_format_type."
+            "Provide at least one formatting option (background_color, text_color, "
+            "number_format_type, wrap_strategy, horizontal_alignment, vertical_alignment, "
+            "bold, italic, or font_size)."
         )
 
+    # Parse colors
     bg_color_parsed = _parse_hex_color(background_color)
     text_color_parsed = _parse_hex_color(text_color)
 
+    # Validate and normalize number format
     number_format = None
     if number_format_type:
         allowed_number_formats = {
@@ -435,6 +452,37 @@ async def format_sheet_range(
         if number_format_pattern:
             number_format["pattern"] = number_format_pattern
 
+    # Validate and normalize wrap_strategy
+    wrap_strategy_normalized = None
+    if wrap_strategy:
+        allowed_wrap_strategies = {"WRAP", "CLIP", "OVERFLOW_CELL"}
+        wrap_strategy_normalized = wrap_strategy.upper()
+        if wrap_strategy_normalized not in allowed_wrap_strategies:
+            raise UserInputError(
+                f"wrap_strategy must be one of {sorted(allowed_wrap_strategies)}."
+            )
+
+    # Validate and normalize horizontal_alignment
+    h_align_normalized = None
+    if horizontal_alignment:
+        allowed_h_alignments = {"LEFT", "CENTER", "RIGHT"}
+        h_align_normalized = horizontal_alignment.upper()
+        if h_align_normalized not in allowed_h_alignments:
+            raise UserInputError(
+                f"horizontal_alignment must be one of {sorted(allowed_h_alignments)}."
+            )
+
+    # Validate and normalize vertical_alignment
+    v_align_normalized = None
+    if vertical_alignment:
+        allowed_v_alignments = {"TOP", "MIDDLE", "BOTTOM"}
+        v_align_normalized = vertical_alignment.upper()
+        if v_align_normalized not in allowed_v_alignments:
+            raise UserInputError(
+                f"vertical_alignment must be one of {sorted(allowed_v_alignments)}."
+            )
+
+    # Get sheet metadata for range parsing
     metadata = await asyncio.to_thread(
         service.spreadsheets()
         .get(
@@ -446,23 +494,65 @@ async def format_sheet_range(
     sheets = metadata.get("sheets", [])
     grid_range = _parse_a1_range(range_name, sheets)
 
+    # Build userEnteredFormat and fields list
     user_entered_format = {}
     fields = []
+
+    # Background color
     if bg_color_parsed:
         user_entered_format["backgroundColor"] = bg_color_parsed
         fields.append("userEnteredFormat.backgroundColor")
+
+    # Text format (color, bold, italic, fontSize)
+    text_format = {}
+    text_format_fields = []
+
     if text_color_parsed:
-        user_entered_format["textFormat"] = {"foregroundColor": text_color_parsed}
-        fields.append("userEnteredFormat.textFormat.foregroundColor")
+        text_format["foregroundColor"] = text_color_parsed
+        text_format_fields.append("userEnteredFormat.textFormat.foregroundColor")
+
+    if bold is not None:
+        text_format["bold"] = bold
+        text_format_fields.append("userEnteredFormat.textFormat.bold")
+
+    if italic is not None:
+        text_format["italic"] = italic
+        text_format_fields.append("userEnteredFormat.textFormat.italic")
+
+    if font_size is not None:
+        text_format["fontSize"] = font_size
+        text_format_fields.append("userEnteredFormat.textFormat.fontSize")
+
+    if text_format:
+        user_entered_format["textFormat"] = text_format
+        fields.extend(text_format_fields)
+
+    # Number format
     if number_format:
         user_entered_format["numberFormat"] = number_format
         fields.append("userEnteredFormat.numberFormat")
 
+    # Wrap strategy
+    if wrap_strategy_normalized:
+        user_entered_format["wrapStrategy"] = wrap_strategy_normalized
+        fields.append("userEnteredFormat.wrapStrategy")
+
+    # Horizontal alignment
+    if h_align_normalized:
+        user_entered_format["horizontalAlignment"] = h_align_normalized
+        fields.append("userEnteredFormat.horizontalAlignment")
+
+    # Vertical alignment
+    if v_align_normalized:
+        user_entered_format["verticalAlignment"] = v_align_normalized
+        fields.append("userEnteredFormat.verticalAlignment")
+
     if not user_entered_format:
         raise UserInputError(
-            "No formatting applied. Verify provided colors or number format."
+            "No formatting applied. Verify provided formatting options."
         )
 
+    # Build and execute request
     request_body = {
         "requests": [
             {
@@ -481,21 +571,116 @@ async def format_sheet_range(
         .execute
     )
 
+    # Build confirmation message
     applied_parts = []
     if bg_color_parsed:
         applied_parts.append(f"background {background_color}")
     if text_color_parsed:
-        applied_parts.append(f"text {text_color}")
+        applied_parts.append(f"text color {text_color}")
     if number_format:
         nf_desc = number_format["type"]
         if number_format_pattern:
             nf_desc += f" (pattern: {number_format_pattern})"
-        applied_parts.append(f"format {nf_desc}")
+        applied_parts.append(f"number format {nf_desc}")
+    if wrap_strategy_normalized:
+        applied_parts.append(f"wrap {wrap_strategy_normalized}")
+    if h_align_normalized:
+        applied_parts.append(f"horizontal align {h_align_normalized}")
+    if v_align_normalized:
+        applied_parts.append(f"vertical align {v_align_normalized}")
+    if bold is not None:
+        applied_parts.append("bold" if bold else "not bold")
+    if italic is not None:
+        applied_parts.append("italic" if italic else "not italic")
+    if font_size is not None:
+        applied_parts.append(f"font size {font_size}")
 
     summary = ", ".join(applied_parts)
+
+    # Return structured data for the wrapper to format
+    return {
+        "range_name": range_name,
+        "spreadsheet_id": spreadsheet_id,
+        "summary": summary,
+    }
+
+
+@server.tool()
+@handle_http_errors("format_sheet_range", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def format_sheet_range(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    range_name: str,
+    background_color: Optional[str] = None,
+    text_color: Optional[str] = None,
+    number_format_type: Optional[str] = None,
+    number_format_pattern: Optional[str] = None,
+    wrap_strategy: Optional[str] = None,
+    horizontal_alignment: Optional[str] = None,
+    vertical_alignment: Optional[str] = None,
+    bold: Optional[bool] = None,
+    italic: Optional[bool] = None,
+    font_size: Optional[int] = None,
+) -> str:
+    """
+    Applies formatting to a range: colors, number formats, text wrapping,
+    alignment, and text styling.
+
+    Colors accept hex strings (#RRGGBB). Number formats follow Sheets types
+    (e.g., NUMBER, CURRENCY, DATE, PERCENT). If no sheet name is provided,
+    the first sheet is used.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        range_name (str): A1-style range (optionally with sheet name). Required.
+        background_color (Optional[str]): Hex background color (e.g., "#FFEECC").
+        text_color (Optional[str]): Hex text color (e.g., "#000000").
+        number_format_type (Optional[str]): Sheets number format type (e.g., "DATE").
+        number_format_pattern (Optional[str]): Custom pattern for the number format.
+        wrap_strategy (Optional[str]): Text wrap strategy - WRAP (wrap text within
+            cell), CLIP (clip text at cell boundary), or OVERFLOW_CELL (allow text
+            to overflow into adjacent empty cells).
+        horizontal_alignment (Optional[str]): Horizontal text alignment - LEFT,
+            CENTER, or RIGHT.
+        vertical_alignment (Optional[str]): Vertical text alignment - TOP, MIDDLE,
+            or BOTTOM.
+        bold (Optional[bool]): Whether to apply bold formatting.
+        italic (Optional[bool]): Whether to apply italic formatting.
+        font_size (Optional[int]): Font size in points.
+
+    Returns:
+        str: Confirmation of the applied formatting.
+    """
+    logger.info(
+        "[format_sheet_range] Invoked. Email: '%s', Spreadsheet: %s, Range: %s",
+        user_google_email,
+        spreadsheet_id,
+        range_name,
+    )
+
+    result = await _format_sheet_range_impl(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        range_name=range_name,
+        background_color=background_color,
+        text_color=text_color,
+        number_format_type=number_format_type,
+        number_format_pattern=number_format_pattern,
+        wrap_strategy=wrap_strategy,
+        horizontal_alignment=horizontal_alignment,
+        vertical_alignment=vertical_alignment,
+        bold=bold,
+        italic=italic,
+        font_size=font_size,
+    )
+
+    # Build confirmation message with user email
     return (
-        f"Applied formatting to range '{range_name}' in spreadsheet {spreadsheet_id} "
-        f"for {user_google_email}: {summary}."
+        f"Applied formatting to range '{result['range_name']}' in spreadsheet "
+        f"{result['spreadsheet_id']} for {user_google_email}: {result['summary']}."
     )
 
 
