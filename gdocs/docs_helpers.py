@@ -279,18 +279,31 @@ def create_insert_image_request(
 
 
 def create_bullet_list_request(
-    start_index: int, end_index: int, list_type: str = "UNORDERED"
-) -> Dict[str, Any]:
+    start_index: int,
+    end_index: int,
+    list_type: str = "UNORDERED",
+    nesting_level: int = None,
+    paragraph_start_indices: Optional[list[int]] = None,
+) -> list[Dict[str, Any]]:
     """
-    Create a createParagraphBullets request for Google Docs API.
+    Create requests to apply bullet list formatting with optional nesting.
+
+    Google Docs infers list nesting from leading tab characters. To set a nested
+    level, this helper inserts literal tab characters before each targeted
+    paragraph, then calls createParagraphBullets. This is a Docs API workaround
+    and does temporarily mutate content/index positions while the batch executes.
 
     Args:
         start_index: Start of text range to convert to list
         end_index: End of text range to convert to list
         list_type: Type of list ("UNORDERED" or "ORDERED")
+        nesting_level: Nesting level (0-8, where 0 is top level). If None or 0, no tabs added.
+        paragraph_start_indices: Optional paragraph start positions for ranges with
+            multiple paragraphs. If omitted, only start_index is tab-prefixed.
 
     Returns:
-        Dictionary representing the createParagraphBullets request
+        List of request dictionaries (insertText for nesting tabs if needed,
+        then createParagraphBullets)
     """
     bullet_preset = (
         "BULLET_DISC_CIRCLE_SQUARE"
@@ -298,12 +311,60 @@ def create_bullet_list_request(
         else "NUMBERED_DECIMAL_ALPHA_ROMAN"
     )
 
-    return {
-        "createParagraphBullets": {
-            "range": {"startIndex": start_index, "endIndex": end_index},
-            "bulletPreset": bullet_preset,
+    # Validate nesting level
+    if nesting_level is not None:
+        if not isinstance(nesting_level, int):
+            raise ValueError("nesting_level must be an integer between 0 and 8")
+        if nesting_level < 0 or nesting_level > 8:
+            raise ValueError("nesting_level must be between 0 and 8")
+
+    requests = []
+
+    # Insert tabs for nesting if needed (nesting_level > 0).
+    # For multi-paragraph ranges, callers should provide paragraph_start_indices.
+    if nesting_level and nesting_level > 0:
+        tabs = "\t" * nesting_level
+        paragraph_starts = paragraph_start_indices or [start_index]
+        paragraph_starts = sorted(set(paragraph_starts))
+
+        if any(not isinstance(idx, int) for idx in paragraph_starts):
+            raise ValueError("paragraph_start_indices must contain only integers")
+
+        original_start = start_index
+        original_end = end_index
+        inserted_char_count = 0
+
+        for paragraph_start in paragraph_starts:
+            adjusted_start = paragraph_start + inserted_char_count
+            requests.append(
+                {
+                    "insertText": {
+                        "location": {"index": adjusted_start},
+                        "text": tabs,
+                    }
+                }
+            )
+            inserted_char_count += nesting_level
+
+        # Keep createParagraphBullets range aligned to the same logical content.
+        start_index += (
+            sum(1 for idx in paragraph_starts if idx < original_start) * nesting_level
+        )
+        end_index += (
+            sum(1 for idx in paragraph_starts if idx < original_end) * nesting_level
+        )
+
+    # Create the bullet list
+    requests.append(
+        {
+            "createParagraphBullets": {
+                "range": {"startIndex": start_index, "endIndex": end_index},
+                "bulletPreset": bullet_preset,
+            }
         }
-    }
+    )
+
+    return requests
 
 
 def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:

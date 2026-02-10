@@ -1902,3 +1902,174 @@ async def transfer_drive_ownership(
     output_parts.extend(["", "Note: Previous owner now has editor access."])
 
     return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors(
+    "set_drive_file_permissions", is_read_only=False, service_type="drive"
+)
+@require_google_service("drive", "drive_file")
+async def set_drive_file_permissions(
+    service,
+    user_google_email: str,
+    file_id: str,
+    link_sharing: Optional[str] = None,
+    writers_can_share: Optional[bool] = None,
+    copy_requires_writer_permission: Optional[bool] = None,
+) -> str:
+    """
+    Sets file-level sharing settings and controls link sharing for a Google Drive file or folder.
+
+    This is a high-level tool for the most common permission changes. Use this to toggle
+    "anyone with the link" access or configure file-level sharing behavior. For managing
+    individual user/group permissions, use share_drive_file or update_drive_permission instead.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file or folder. Required.
+        link_sharing (Optional[str]): Control "anyone with the link" access for the file.
+            - "off": Disable "anyone with the link" access for this file.
+            - "reader": Anyone with the link can view.
+            - "commenter": Anyone with the link can comment.
+            - "writer": Anyone with the link can edit.
+        writers_can_share (Optional[bool]): Whether editors can change permissions and share.
+            If False, only the owner can share. Defaults to None (no change).
+        copy_requires_writer_permission (Optional[bool]): Whether viewers and commenters
+            are prevented from copying, printing, or downloading. Defaults to None (no change).
+
+    Returns:
+        str: Summary of all permission changes applied to the file.
+    """
+    logger.info(
+        f"[set_drive_file_permissions] Invoked. Email: '{user_google_email}', "
+        f"File ID: '{file_id}', Link sharing: '{link_sharing}', "
+        f"Writers can share: {writers_can_share}, Copy restriction: {copy_requires_writer_permission}"
+    )
+
+    if (
+        link_sharing is None
+        and writers_can_share is None
+        and copy_requires_writer_permission is None
+    ):
+        raise ValueError(
+            "Must provide at least one of: link_sharing, writers_can_share, copy_requires_writer_permission"
+        )
+
+    valid_link_sharing = {"off", "reader", "commenter", "writer"}
+    if link_sharing is not None and link_sharing not in valid_link_sharing:
+        raise ValueError(
+            f"Invalid link_sharing '{link_sharing}'. Must be one of: {', '.join(sorted(valid_link_sharing))}"
+        )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name, webViewLink"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown")
+
+    output_parts = [f"Permission settings updated for '{file_name}'", ""]
+    changes_made = []
+
+    # Handle file-level settings via files().update()
+    file_update_body = {}
+    if writers_can_share is not None:
+        file_update_body["writersCanShare"] = writers_can_share
+    if copy_requires_writer_permission is not None:
+        file_update_body["copyRequiresWriterPermission"] = (
+            copy_requires_writer_permission
+        )
+
+    if file_update_body:
+        await asyncio.to_thread(
+            service.files()
+            .update(
+                fileId=file_id,
+                body=file_update_body,
+                supportsAllDrives=True,
+                fields="id",
+            )
+            .execute
+        )
+        if writers_can_share is not None:
+            state = "allowed" if writers_can_share else "restricted to owner"
+            changes_made.append(f"  - Editors sharing: {state}")
+        if copy_requires_writer_permission is not None:
+            state = "restricted" if copy_requires_writer_permission else "allowed"
+            changes_made.append(f"  - Viewers copy/print/download: {state}")
+
+    # Handle link sharing via permissions API
+    if link_sharing is not None:
+        current_permissions = await asyncio.to_thread(
+            service.permissions()
+            .list(
+                fileId=file_id,
+                supportsAllDrives=True,
+                fields="permissions(id, type, role)",
+            )
+            .execute
+        )
+        anyone_perms = [
+            p
+            for p in current_permissions.get("permissions", [])
+            if p.get("type") == "anyone"
+        ]
+
+        if link_sharing == "off":
+            if anyone_perms:
+                for perm in anyone_perms:
+                    await asyncio.to_thread(
+                        service.permissions()
+                        .delete(
+                            fileId=file_id,
+                            permissionId=perm["id"],
+                            supportsAllDrives=True,
+                        )
+                        .execute
+                    )
+                changes_made.append(
+                    "  - Link sharing: disabled (restricted to specific people)"
+                )
+            else:
+                changes_made.append("  - Link sharing: already off (no change)")
+        else:
+            if anyone_perms:
+                await asyncio.to_thread(
+                    service.permissions()
+                    .update(
+                        fileId=file_id,
+                        permissionId=anyone_perms[0]["id"],
+                        body={
+                            "role": link_sharing,
+                            "allowFileDiscovery": False,
+                        },
+                        supportsAllDrives=True,
+                        fields="id, type, role",
+                    )
+                    .execute
+                )
+                changes_made.append(f"  - Link sharing: updated to '{link_sharing}'")
+            else:
+                await asyncio.to_thread(
+                    service.permissions()
+                    .create(
+                        fileId=file_id,
+                        body={
+                            "type": "anyone",
+                            "role": link_sharing,
+                            "allowFileDiscovery": False,
+                        },
+                        supportsAllDrives=True,
+                        fields="id, type, role",
+                    )
+                    .execute
+                )
+                changes_made.append(f"  - Link sharing: enabled as '{link_sharing}'")
+
+    output_parts.append("Changes:")
+    if changes_made:
+        output_parts.extend(changes_made)
+    else:
+        output_parts.append("  - No changes (already configured)")
+    output_parts.extend(["", f"View link: {file_metadata.get('webViewLink', 'N/A')}"])
+
+    return "\n".join(output_parts)

@@ -392,7 +392,7 @@ async def start_auth_flow(
         store.store_oauth_state(oauth_state, session_id=session_id)
 
         logger.info(
-            f"Auth flow started for {user_display_name}. State: {oauth_state[:8]}... Advise user to visit: {auth_url}"
+            f"Auth flow started for {user_display_name}. Advise user to visit: {auth_url}"
         )
 
         message_lines = [
@@ -565,52 +565,74 @@ def get_credentials(
     Returns:
         Valid Credentials object or None.
     """
+    skip_session_cache = False
     # First, try OAuth 2.1 session store if we have a session_id (FastMCP session)
     if session_id:
         try:
             store = get_oauth21_session_store()
 
-            # Try to get credentials by MCP session
-            credentials = store.get_credentials_by_mcp_session(session_id)
-            if credentials:
+            session_user = store.get_user_by_mcp_session(session_id)
+            if user_google_email and session_user and session_user != user_google_email:
                 logger.info(
-                    f"[get_credentials] Found OAuth 2.1 credentials for MCP session {session_id}"
+                    f"[get_credentials] Session user {session_user} doesn't match requested {user_google_email}; "
+                    "skipping session store"
                 )
-
-                # Check scopes
-                if not all(scope in credentials.scopes for scope in required_scopes):
-                    logger.warning(
-                        f"[get_credentials] OAuth 2.1 credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}"
+                skip_session_cache = True
+            else:
+                # Try to get credentials by MCP session
+                credentials = store.get_credentials_by_mcp_session(session_id)
+                if credentials:
+                    logger.info(
+                        f"[get_credentials] Found OAuth 2.1 credentials for MCP session {session_id}"
                     )
-                    return None
 
-                # Return if valid
-                if credentials.valid:
-                    return credentials
-                elif credentials.expired and credentials.refresh_token:
-                    # Try to refresh
-                    try:
-                        credentials.refresh(Request())
-                        logger.info(
-                            f"[get_credentials] Refreshed OAuth 2.1 credentials for session {session_id}"
-                        )
-                        # Update stored credentials
-                        user_email = store.get_user_by_mcp_session(session_id)
-                        if user_email:
-                            store.store_session(
-                                user_email=user_email,
-                                access_token=credentials.token,
-                                refresh_token=credentials.refresh_token,
-                                scopes=credentials.scopes,
-                                expiry=credentials.expiry,
-                                mcp_session_id=session_id,
-                            )
-                        return credentials
-                    except Exception as e:
-                        logger.error(
-                            f"[get_credentials] Failed to refresh OAuth 2.1 credentials: {e}"
+                    # Check scopes
+                    if not all(
+                        scope in credentials.scopes for scope in required_scopes
+                    ):
+                        logger.warning(
+                            f"[get_credentials] OAuth 2.1 credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}"
                         )
                         return None
+
+                    # Return if valid
+                    if credentials.valid:
+                        return credentials
+                    elif credentials.expired and credentials.refresh_token:
+                        # Try to refresh
+                        try:
+                            credentials.refresh(Request())
+                            logger.info(
+                                f"[get_credentials] Refreshed OAuth 2.1 credentials for session {session_id}"
+                            )
+                            # Update stored credentials
+                            user_email = store.get_user_by_mcp_session(session_id)
+                            if user_email:
+                                store.store_session(
+                                    user_email=user_email,
+                                    access_token=credentials.token,
+                                    refresh_token=credentials.refresh_token,
+                                    scopes=credentials.scopes,
+                                    expiry=credentials.expiry,
+                                    mcp_session_id=session_id,
+                                )
+                                # Persist to file so rotated refresh tokens survive restarts
+                                if not is_stateless_mode():
+                                    try:
+                                        credential_store = get_credential_store()
+                                        credential_store.store_credential(
+                                            user_email, credentials
+                                        )
+                                    except Exception as persist_error:
+                                        logger.warning(
+                                            f"[get_credentials] Failed to persist refreshed OAuth 2.1 credentials for user {user_email}: {persist_error}"
+                                        )
+                            return credentials
+                        except Exception as e:
+                            logger.error(
+                                f"[get_credentials] Failed to refresh OAuth 2.1 credentials: {e}"
+                            )
+                            return None
         except ImportError:
             pass  # OAuth 2.1 store not available
         except Exception as e:
@@ -646,7 +668,7 @@ def get_credentials(
             f"[get_credentials] Called for user_google_email: '{user_google_email}', session_id: '{session_id}', required_scopes: {required_scopes}"
         )
 
-        if session_id:
+        if session_id and not skip_session_cache:
             credentials = load_credentials_from_session(session_id)
             if credentials:
                 logger.debug(
@@ -669,9 +691,10 @@ def get_credentials(
                 logger.debug(
                     f"[get_credentials] Loaded from file for user '{user_google_email}', caching to session '{session_id}'."
                 )
-                save_credentials_to_session(
-                    session_id, credentials
-                )  # Cache for current session
+                if not skip_session_cache:
+                    save_credentials_to_session(
+                        session_id, credentials
+                    )  # Cache for current session
 
         if not credentials:
             logger.info(
@@ -759,11 +782,17 @@ def get_credentials(
         return None
 
 
-def get_user_info(credentials: Credentials) -> Optional[Dict[str, Any]]:
+def get_user_info(
+    credentials: Credentials, *, skip_valid_check: bool = False
+) -> Optional[Dict[str, Any]]:
     """Fetches basic user profile information (requires userinfo.email scope)."""
-    if not credentials or not credentials.valid:
-        logger.error("Cannot get user info: Invalid or missing credentials.")
+    if not credentials:
+        logger.error("Cannot get user info: Missing credentials.")
         return None
+    if not skip_valid_check and not credentials.valid:
+        logger.error("Cannot get user info: Invalid credentials.")
+        return None
+    service = None
     try:
         # Using googleapiclient discovery to get user info
         # Requires 'google-api-python-client' library

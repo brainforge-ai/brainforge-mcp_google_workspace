@@ -38,6 +38,7 @@ drive:
     - remove_drive_permission
     - transfer_drive_ownership
     - batch_share_drive_file
+    - set_drive_file_permissions
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access
