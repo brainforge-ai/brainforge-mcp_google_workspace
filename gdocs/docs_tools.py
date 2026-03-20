@@ -375,6 +375,7 @@ async def modify_doc_text(
     bold: bool = None,
     italic: bool = None,
     underline: bool = None,
+    strikethrough: bool = None,
     font_size: int = None,
     font_family: str = None,
     text_color: str = None,
@@ -393,6 +394,7 @@ async def modify_doc_text(
         bold: Whether to make text bold (True/False/None to leave unchanged)
         italic: Whether to make text italic (True/False/None to leave unchanged)
         underline: Whether to underline text (True/False/None to leave unchanged)
+        strikethrough: Whether to strike through text (True/False/None to leave unchanged)
         font_size: Font size in points
         font_family: Font family name (e.g., "Arial", "Times New Roman")
         text_color: Foreground text color (#RRGGBB)
@@ -404,7 +406,7 @@ async def modify_doc_text(
     """
     logger.info(
         f"[modify_doc_text] Doc={document_id}, start={start_index}, end={end_index}, text={text is not None}, "
-        f"formatting={any(p is not None for p in [bold, italic, underline, font_size, font_family, text_color, background_color, link_url])}"
+        f"formatting={any(p is not None for p in [bold, italic, underline, strikethrough, font_size, font_family, text_color, background_color, link_url])}"
     )
 
     # Input validation
@@ -419,6 +421,7 @@ async def modify_doc_text(
         bold,
         italic,
         underline,
+        strikethrough,
         font_size,
         font_family,
         text_color,
@@ -426,7 +429,7 @@ async def modify_doc_text(
         link_url,
     ]
     if text is None and not any(p is not None for p in formatting_params):
-        return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, font_size, font_family, text_color, background_color, link_url)."
+        return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, strikethrough, font_size, font_family, text_color, background_color, link_url)."
 
     # Validate text formatting params if provided
     if any(p is not None for p in formatting_params):
@@ -434,6 +437,7 @@ async def modify_doc_text(
             bold,
             italic,
             underline,
+            strikethrough,
             font_size,
             font_family,
             text_color,
@@ -515,6 +519,7 @@ async def modify_doc_text(
                 bold,
                 italic,
                 underline,
+                strikethrough,
                 font_size,
                 font_family,
                 text_color,
@@ -529,6 +534,7 @@ async def modify_doc_text(
                 ("bold", bold),
                 ("italic", italic),
                 ("underline", underline),
+                ("strikethrough", strikethrough),
                 ("font_size", font_size),
                 ("font_family", font_family),
                 ("text_color", text_color),
@@ -860,8 +866,8 @@ async def batch_update_doc(
       delete_text      - required: start_index (int), end_index (int)
       replace_text     - required: start_index (int), end_index (int), text (str)
       format_text      - required: start_index (int), end_index (int)
-                         optional: bold, italic, underline, font_size, font_family,
-                                   text_color, background_color, link_url
+                         optional: bold, italic, underline, strikethrough, font_size,
+                                   font_family, text_color, background_color, link_url
       update_paragraph_style
                        - required: start_index (int), end_index (int)
                          optional: heading_level (0-6, 0=normal), alignment
@@ -1463,6 +1469,7 @@ async def update_paragraph_style(
     indent_end: float = None,
     space_above: float = None,
     space_below: float = None,
+    named_style_type: str = None,
     list_type: str = None,
     list_nesting_level: int = None,
 ) -> str:
@@ -1488,6 +1495,8 @@ async def update_paragraph_style(
         indent_end: Right/end indent in points
         space_above: Space above paragraph in points (e.g., 12 for one line)
         space_below: Space below paragraph in points
+        named_style_type: Direct named style type - 'NORMAL_TEXT', 'TITLE', 'SUBTITLE',
+                         'HEADING_1' through 'HEADING_6'. Mutually exclusive with heading_level.
         list_type: Create a list from existing paragraphs ('UNORDERED' for bullets, 'ORDERED' for numbers)
         list_nesting_level: Nesting level for lists (0-8, where 0 is top level, default is 0)
                            Use higher levels for nested/indented list items
@@ -1546,12 +1555,36 @@ async def update_paragraph_style(
         if list_nesting_level < 0 or list_nesting_level > 8:
             return "Error: list_nesting_level must be between 0 and 8"
 
+    # Validate named_style_type
+    if named_style_type is not None and heading_level is not None:
+        return "Error: heading_level and named_style_type are mutually exclusive; provide only one"
+
+    if named_style_type is not None:
+        valid_styles = [
+            "NORMAL_TEXT",
+            "TITLE",
+            "SUBTITLE",
+            "HEADING_1",
+            "HEADING_2",
+            "HEADING_3",
+            "HEADING_4",
+            "HEADING_5",
+            "HEADING_6",
+        ]
+        if named_style_type not in valid_styles:
+            return f"Error: Invalid named_style_type '{named_style_type}'. Must be one of: {', '.join(valid_styles)}"
+
     # Build paragraph style object
     paragraph_style = {}
     fields = []
 
+    # Handle named_style_type (direct named style)
+    if named_style_type is not None:
+        paragraph_style["namedStyleType"] = named_style_type
+        fields.append("namedStyleType")
+
     # Handle heading level (named style)
-    if heading_level is not None:
+    elif heading_level is not None:
         if heading_level < 0 or heading_level > 6:
             return "Error: heading_level must be between 0 (normal text) and 6"
         if heading_level == 0:

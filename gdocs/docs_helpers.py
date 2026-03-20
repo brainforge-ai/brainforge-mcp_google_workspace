@@ -42,6 +42,7 @@ def build_text_style(
     bold: bool = None,
     italic: bool = None,
     underline: bool = None,
+    strikethrough: bool = None,
     font_size: int = None,
     font_family: str = None,
     text_color: str = None,
@@ -55,6 +56,7 @@ def build_text_style(
         bold: Whether text should be bold
         italic: Whether text should be italic
         underline: Whether text should be underlined
+        strikethrough: Whether text should be struck through
         font_size: Font size in points
         font_family: Font family name
         text_color: Text color as hex string "#RRGGBB"
@@ -78,6 +80,10 @@ def build_text_style(
     if underline is not None:
         text_style["underline"] = underline
         fields.append("underline")
+
+    if strikethrough is not None:
+        text_style["strikethrough"] = strikethrough
+        fields.append("strikethrough")
 
     if font_size is not None:
         text_style["fontSize"] = {"magnitude": font_size, "unit": "PT"}
@@ -138,9 +144,15 @@ def build_paragraph_style(
 
     if named_style_type is not None:
         valid_styles = [
-            "NORMAL_TEXT", "TITLE", "SUBTITLE",
-            "HEADING_1", "HEADING_2", "HEADING_3",
-            "HEADING_4", "HEADING_5", "HEADING_6",
+            "NORMAL_TEXT",
+            "TITLE",
+            "SUBTITLE",
+            "HEADING_1",
+            "HEADING_2",
+            "HEADING_3",
+            "HEADING_4",
+            "HEADING_5",
+            "HEADING_6",
         ]
         if named_style_type not in valid_styles:
             raise ValueError(
@@ -272,6 +284,7 @@ def create_format_text_request(
     bold: bool = None,
     italic: bool = None,
     underline: bool = None,
+    strikethrough: bool = None,
     font_size: int = None,
     font_family: str = None,
     text_color: str = None,
@@ -288,6 +301,7 @@ def create_format_text_request(
         bold: Whether text should be bold
         italic: Whether text should be italic
         underline: Whether text should be underlined
+        strikethrough: Whether text should be struck through
         font_size: Font size in points
         font_family: Font family name
         text_color: Text color as hex string "#RRGGBB"
@@ -302,6 +316,7 @@ def create_format_text_request(
         bold,
         italic,
         underline,
+        strikethrough,
         font_size,
         font_family,
         text_color,

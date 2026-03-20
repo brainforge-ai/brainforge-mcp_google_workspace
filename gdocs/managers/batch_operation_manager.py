@@ -204,6 +204,7 @@ class BatchOperationManager:
                 op.get("bold"),
                 op.get("italic"),
                 op.get("underline"),
+                op.get("strikethrough"),
                 op.get("font_size"),
                 op.get("font_family"),
                 op.get("text_color"),
@@ -221,6 +222,7 @@ class BatchOperationManager:
                 ("bold", "bold"),
                 ("italic", "italic"),
                 ("underline", "underline"),
+                ("strikethrough", "strikethrough"),
                 ("font_size", "font size"),
                 ("font_family", "font family"),
                 ("text_color", "text color"),
@@ -325,7 +327,9 @@ class BatchOperationManager:
                     tab_id,
                 )
                 style = "bulleted" if list_type == "UNORDERED" else "numbered"
-                description = f"create {style} list {op['start_index']}-{op['end_index']}"
+                description = (
+                    f"create {style} list {op['start_index']}-{op['end_index']}"
+                )
                 if op.get("nesting_level"):
                     description += f" (nesting level {op['nesting_level']})"
 
@@ -454,6 +458,7 @@ class BatchOperationManager:
                         "bold",
                         "italic",
                         "underline",
+                        "strikethrough",
                         "font_size",
                         "font_family",
                         "text_color",
@@ -473,6 +478,7 @@ class BatchOperationManager:
                         "indent_end",
                         "space_above",
                         "space_below",
+                        "named_style_type",
                     ],
                     "description": "Apply paragraph-level styling (headings, alignment, spacing, indentation)",
                 },
@@ -491,7 +497,11 @@ class BatchOperationManager:
                 },
                 "create_bullet_list": {
                     "required": ["start_index", "end_index"],
-                    "optional": ["list_type", "nesting_level", "paragraph_start_indices"],
+                    "optional": [
+                        "list_type",
+                        "nesting_level",
+                        "paragraph_start_indices",
+                    ],
                     "description": "Apply or remove native bullet/numbered list formatting (list_type: UNORDERED, ORDERED, or NONE to remove; nesting_level: 0-8)",
                 },
                 "insert_doc_tab": {
