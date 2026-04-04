@@ -822,7 +822,9 @@ class ValidationManager:
             (padding_right, "padding_right"),
         ):
             if padding_value is not None:
-                if not isinstance(padding_value, (int, float)):
+                if isinstance(padding_value, bool) or not isinstance(
+                    padding_value, (int, float)
+                ):
                     return (
                         False,
                         f"{padding_name} must be a number, got {type(padding_value).__name__}",

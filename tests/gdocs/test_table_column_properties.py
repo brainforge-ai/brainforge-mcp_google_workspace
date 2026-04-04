@@ -72,6 +72,7 @@ class TestCreateUpdateTableColumnPropertiesRequest:
         result = create_update_table_column_properties_request(
             table_start_index=10,
             column_indices=[0],
+            width=60.0,
         )
         location = result["updateTableColumnProperties"]["tableStartLocation"]
         assert "tabId" not in location
@@ -89,13 +90,12 @@ class TestCreateUpdateTableColumnPropertiesRequest:
         assert "tableColumnProperties" in inner
         assert "fields" in inner
 
-    def test_empty_fields_when_no_properties(self):
+    def test_returns_none_when_no_properties(self):
         result = create_update_table_column_properties_request(
             table_start_index=10,
             column_indices=[0],
         )
-        inner = result["updateTableColumnProperties"]
-        assert inner["fields"] == ""
+        assert result is None
 
 
 class TestValidateOperation:
@@ -172,6 +172,17 @@ class TestBatchManagerIntegration:
         )
         assert success
         assert meta["operations_count"] == 1
+
+    def test_no_properties_raises_value_error(self, manager):
+        with pytest.raises(ValueError, match="at least one of"):
+            manager._build_operation_request(
+                {
+                    "type": "update_table_column_properties",
+                    "table_start_index": 10,
+                    "column_indices": [0],
+                },
+                "update_table_column_properties",
+            )
 
     def test_supported_operations_include_update_table_column_properties(self, manager):
         supported = manager.get_supported_operations()["supported_operations"]

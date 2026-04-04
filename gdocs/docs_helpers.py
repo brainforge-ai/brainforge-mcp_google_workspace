@@ -1606,8 +1606,8 @@ def create_update_table_column_properties_request(
     width: float = None,
     width_type: str = None,
     tab_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Build an updateTableColumnProperties request."""
+) -> Optional[Dict[str, Any]]:
+    """Build an updateTableColumnProperties request. Returns None if no properties set."""
     location: Dict[str, Any] = {"index": table_start_index}
     if tab_id:
         location["tabId"] = tab_id
@@ -1622,6 +1622,9 @@ def create_update_table_column_properties_request(
     if width_type is not None:
         properties["widthType"] = width_type
         fields.append("widthType")
+
+    if not fields:
+        return None
 
     return {
         "updateTableColumnProperties": {
