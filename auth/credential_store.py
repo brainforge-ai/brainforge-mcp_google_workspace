@@ -127,7 +127,7 @@ class LocalDirectoryCredentialStore(CredentialStore):
             logger.info(f"Created credentials directory: {self.base_dir}")
 
         # Sanitize email to prevent path traversal
-        safe_email = re.sub(r'[^a-zA-Z0-9@._-]', '_', user_email)
+        safe_email = re.sub(r"[^a-zA-Z0-9@._-]", "_", user_email)
         creds_path = os.path.join(self.base_dir, f"{safe_email}.json")
 
         # Verify resolved path is still under base_dir

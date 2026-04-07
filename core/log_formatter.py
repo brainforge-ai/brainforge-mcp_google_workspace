@@ -183,9 +183,7 @@ def configure_file_logging(logger_name: str = None) -> bool:
         target_logger = logging.getLogger(logger_name)
 
         # Write logs to user-specific directory, not the package directory
-        log_dir = os.path.join(
-            os.path.expanduser("~"), ".google_workspace_mcp", "logs"
-        )
+        log_dir = os.path.join(os.path.expanduser("~"), ".google_workspace_mcp", "logs")
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
         log_file_path = os.path.join(log_dir, "mcp_server_debug.log")
 

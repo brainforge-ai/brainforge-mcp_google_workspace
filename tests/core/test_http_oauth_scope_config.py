@@ -49,6 +49,7 @@ def test_configure_server_for_http_uses_base_required_scopes(monkeypatch):
 
     assert captured["required_scopes"] == sorted(server_module.BASE_SCOPES)
     assert captured["valid_scopes"] == sorted(server_module.get_current_scopes())
-    assert server_module.server.auth.client_registration_options.default_scopes == sorted(
-        server_module.get_current_scopes()
+    assert (
+        server_module.server.auth.client_registration_options.default_scopes
+        == sorted(server_module.get_current_scopes())
     )
