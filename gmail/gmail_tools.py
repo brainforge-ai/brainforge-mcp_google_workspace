@@ -26,7 +26,11 @@ from googleapiclient.errors import HttpError
 
 from auth.service_decorator import require_google_service
 from core.attachment_storage import get_attachment_storage, STORAGE_DIR
-from core.config import WORKSPACE_EXTERNAL_URL, WORKSPACE_MCP_BASE_URI, WORKSPACE_MCP_PORT
+from core.config import (
+    WORKSPACE_EXTERNAL_URL,
+    WORKSPACE_MCP_BASE_URI,
+    WORKSPACE_MCP_PORT,
+)
 from core.http_utils import ssrf_safe_stream
 from core.utils import (
     handle_http_errors,

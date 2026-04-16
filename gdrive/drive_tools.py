@@ -32,7 +32,10 @@ from core.utils import (
 )
 from core.server import server
 from core.config import get_transport_mode
-from core.http_utils import redact_url as _redact_url, ssrf_safe_stream as _ssrf_safe_stream
+from core.http_utils import (
+    redact_url as _redact_url,
+    ssrf_safe_stream as _ssrf_safe_stream,
+)
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
