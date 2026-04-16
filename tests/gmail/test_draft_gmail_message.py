@@ -15,6 +15,7 @@ import gmail.gmail_tools as gmail_tools
 from core.utils import UserInputError
 from gmail.gmail_tools import (
     draft_gmail_message,
+    send_gmail_message,
     _resolve_url_attachments,
     _try_read_local_attachment,
 )
@@ -766,5 +767,40 @@ async def test_draft_gmail_message_with_url_attachment(monkeypatch):
         mock_service.users.return_value.drafts.return_value.create.call_args.kwargs
     )
     raw_bytes = base64.urlsafe_b64decode(create_kwargs["body"]["message"]["raw"])
+    assert b"Content-Disposition: attachment;" in raw_bytes
+    assert b"doc.pdf" in raw_bytes
+
+
+@pytest.mark.asyncio
+async def test_send_gmail_message_with_url_attachment(monkeypatch):
+    """End-to-end: send_gmail_message should accept a URL attachment."""
+    fake_response = _FakeStreamResponse(
+        200,
+        headers={"content-type": "application/pdf"},
+        chunks=[b"pdf-content-here"],
+    )
+
+    monkeypatch.setattr(
+        gmail_tools, "ssrf_safe_stream", _mock_stream_response(fake_response)
+    )
+
+    mock_service = Mock()
+    mock_service.users().messages().send().execute.return_value = {"id": "msg_url"}
+
+    result = await _unwrap(send_gmail_message)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        to="recipient@example.com",
+        subject="URL attachment test",
+        body="See attached from URL.",
+        attachments=[{"url": "https://example.com/doc.pdf", "filename": "doc.pdf"}],
+    )
+
+    assert "Email sent with 1 attachment(s)! Message ID: msg_url" in result
+
+    create_kwargs = (
+        mock_service.users.return_value.messages.return_value.send.call_args.kwargs
+    )
+    raw_bytes = base64.urlsafe_b64decode(create_kwargs["body"]["raw"])
     assert b"Content-Disposition: attachment;" in raw_bytes
     assert b"doc.pdf" in raw_bytes

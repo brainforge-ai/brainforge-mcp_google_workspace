@@ -1,10 +1,6 @@
-import os
-import sys
 from contextlib import asynccontextmanager
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import gdrive.drive_tools as drive_tools
 
@@ -55,5 +51,5 @@ async def test_download_url_to_bytes_enforces_max_size(monkeypatch):
     )
     monkeypatch.setattr(drive_tools, "MAX_DOWNLOAD_BYTES", 6)
 
-    with pytest.raises(Exception, match="Download exceeded 6 byte limit"):
+    with pytest.raises(ValueError, match="Download from https://example.com/file.bin exceeded 6 byte limit"):
         await drive_tools._download_url_to_bytes("https://example.com/file.bin")

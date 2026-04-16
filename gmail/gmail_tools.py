@@ -15,7 +15,7 @@ import mimetypes
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 
 import httpx
 from email.message import EmailMessage
@@ -747,6 +747,14 @@ async def _fetch_thread_message_ids(service, thread_id: str) -> List[str]:
 MAX_EMAIL_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB Gmail attachment limit
 
 
+def _redact_url(url: str) -> str:
+    """Remove query/fragment components before surfacing a URL in errors or logs."""
+    parsed = urlparse(url)
+    if not parsed.scheme and not parsed.netloc:
+        return parsed.path or url
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
 def _get_trusted_attachment_origins() -> set[tuple[str, str]]:
     """Return local origins allowed to resolve /attachments/{id} from disk."""
     origins: set[tuple[str, str]] = set()
@@ -776,22 +784,54 @@ async def _download_attachment_bytes(url: str) -> tuple[bytes, httpx.Response]:
     """Download an attachment with streaming size enforcement."""
     total_bytes = 0
     chunks: list[bytes] = []
+    redacted_url = _redact_url(url)
 
     async with ssrf_safe_stream(url) as resp:
         if resp.status_code != 200:
             raise ValueError(
-                f"Failed to fetch attachment URL {url} (status {resp.status_code})"
+                f"Failed to fetch attachment URL {redacted_url} (status {resp.status_code})"
             )
 
         async for chunk in resp.aiter_bytes(chunk_size=256 * 1024):
             total_bytes += len(chunk)
             if total_bytes > MAX_EMAIL_ATTACHMENT_BYTES:
                 raise ValueError(
-                    f"Attachment from {url} exceeds 25 MB Gmail limit ({total_bytes} bytes)"
+                    f"Attachment from {redacted_url} exceeds 25 MB Gmail limit ({total_bytes} bytes)"
                 )
             chunks.append(chunk)
 
         return b"".join(chunks), resp
+
+
+def _build_attachment_error_entry(
+    attachment: Dict[str, Any], exc: Exception
+) -> Dict[str, Any]:
+    """Preserve failed attachment context so message creation can continue."""
+    failed_attachment = dict(attachment)
+    if "url" in failed_attachment:
+        failed_attachment["display_url"] = _redact_url(str(failed_attachment["url"]))
+    failed_attachment["error"] = str(exc)
+    failed_attachment["error_type"] = type(exc).__name__
+    return failed_attachment
+
+
+def _format_resolved_attachment_error(attachment: Dict[str, Any]) -> str:
+    """Render a pre-resolved attachment failure for user-facing reporting."""
+    label = (
+        attachment.get("filename")
+        or attachment.get("display_url")
+        or (
+            _redact_url(str(attachment["url"]))
+            if attachment.get("url")
+            else attachment.get("path")
+        )
+        or "attachment"
+    )
+    detail = attachment.get("error", "attachment could not be resolved")
+    error_type = attachment.get("error_type")
+    if error_type:
+        detail = f"{error_type}: {detail}"
+    return f"{label}: {detail}"
 
 
 def _try_read_local_attachment(url: str) -> Optional[tuple[bytes, str, Optional[str]]]:
@@ -867,9 +907,11 @@ async def _resolve_url_attachments(
         # Fast path: MCP-local attachment URL.
         try:
             local = _try_read_local_attachment(url)
-        except ValueError as exc:
-            logger.error("Failed to read local attachment URL %s: %s", url, exc)
-            resolved.append(att)
+        except Exception as exc:
+            logger.exception(
+                "Failed to read local attachment URL %s", _redact_url(url)
+            )
+            resolved.append(_build_attachment_error_entry(att, exc))
             continue
         if local is not None:
             data, local_filename, local_mime = local
@@ -885,9 +927,9 @@ async def _resolve_url_attachments(
         # External URL — SSRF-safe fetch.
         try:
             data, resp = await _download_attachment_bytes(url)
-        except ValueError as exc:
-            logger.error("Failed to fetch attachment URL %s: %s", url, exc)
-            resolved.append(att)  # pass through so _prepare reports the error
+        except Exception as exc:
+            logger.exception("Failed to fetch attachment URL %s", _redact_url(url))
+            resolved.append(_build_attachment_error_entry(att, exc))
             continue
 
         # Infer filename from URL path if not provided.
@@ -1004,6 +1046,10 @@ def _prepare_gmail_message(
         message.set_content(body)
 
     for attachment in attachments or []:
+        if attachment.get("error"):
+            attachment_errors.append(_format_resolved_attachment_error(attachment))
+            continue
+
         file_path = attachment.get("path")
         filename = attachment.get("filename")
         content_base64 = attachment.get("content")

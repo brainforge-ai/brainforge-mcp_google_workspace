@@ -9,12 +9,13 @@ import logging
 import io
 import base64
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Awaitable
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 from pathlib import Path
 
+import httpx
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -54,26 +55,43 @@ UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads
 
 
-async def _download_url_to_bytes(url: str) -> tuple[bytes, Optional[str]]:
-    """Download a remote file into memory with bounded streaming."""
+async def _stream_url_with_validation(
+    url: str, write_chunk: Optional[Callable[[bytes], Awaitable[None]]] = None
+) -> tuple[int, Optional[str]]:
+    """Stream a remote file with shared status and size validation."""
     total_bytes = 0
-    chunks: list[bytes] = []
 
     async with _ssrf_safe_stream(url) as resp:
         if resp.status_code != 200:
-            raise Exception(
-                f"Failed to fetch file from URL: {url} (status {resp.status_code})"
+            request = getattr(resp, "request", None) or httpx.Request("GET", url)
+            raise httpx.HTTPStatusError(
+                f"Failed to fetch file from URL: {url} (status {resp.status_code})",
+                request=request,
+                response=resp,
             )
 
         content_type = resp.headers.get("Content-Type")
         async for chunk in resp.aiter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE_BYTES):
             total_bytes += len(chunk)
             if total_bytes > MAX_DOWNLOAD_BYTES:
-                raise Exception(
-                    f"Download exceeded {MAX_DOWNLOAD_BYTES} byte limit"
+                raise ValueError(
+                    f"Download from {url} exceeded {MAX_DOWNLOAD_BYTES} byte limit "
+                    f"({total_bytes} bytes)"
                 )
-            chunks.append(chunk)
+            if write_chunk is not None:
+                await write_chunk(chunk)
 
+    return total_bytes, content_type
+
+
+async def _download_url_to_bytes(url: str) -> tuple[bytes, Optional[str]]:
+    """Download a remote file into memory with bounded streaming."""
+    chunks: list[bytes] = []
+
+    async def _collect(chunk: bytes) -> None:
+        chunks.append(chunk)
+
+    _total_bytes, content_type = await _stream_url_with_validation(url, _collect)
     return b"".join(chunks), content_type
 
 
@@ -787,27 +805,12 @@ async def create_drive_file(
             else:
                 # Stream download to temp file with SSRF protection, then upload
                 with NamedTemporaryFile() as temp_file:
-                    total_bytes = 0
-                    content_type = None
+                    async def _write_chunk(chunk: bytes) -> None:
+                        await asyncio.to_thread(temp_file.write, chunk)
 
-                    async with _ssrf_safe_stream(fileUrl) as resp:
-                        if resp.status_code != 200:
-                            raise Exception(
-                                f"Failed to fetch file from URL: {fileUrl} "
-                                f"(status {resp.status_code})"
-                            )
-
-                        content_type = resp.headers.get("Content-Type")
-
-                        async for chunk in resp.aiter_bytes(
-                            chunk_size=DOWNLOAD_CHUNK_SIZE_BYTES
-                        ):
-                            total_bytes += len(chunk)
-                            if total_bytes > MAX_DOWNLOAD_BYTES:
-                                raise Exception(
-                                    f"Download exceeded {MAX_DOWNLOAD_BYTES} byte limit"
-                                )
-                            await asyncio.to_thread(temp_file.write, chunk)
+                    total_bytes, content_type = await _stream_url_with_validation(
+                        fileUrl, _write_chunk
+                    )
 
                     logger.info(
                         f"[create_drive_file] Downloaded {total_bytes} bytes "
