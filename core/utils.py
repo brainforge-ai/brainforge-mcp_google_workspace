@@ -105,7 +105,9 @@ def _get_allowed_file_dirs() -> list[Path]:
     env_val = os.environ.get(_ALLOWED_FILE_DIRS_ENV)
     if env_val:
         allowed_dirs.extend(
-            Path(p).expanduser().resolve() for p in env_val.split(os.pathsep) if p.strip()
+            Path(p).expanduser().resolve()
+            for p in env_val.split(os.pathsep)
+            if p.strip()
         )
 
     unique_dirs: list[Path] = []
