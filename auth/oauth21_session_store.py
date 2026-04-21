@@ -329,8 +329,8 @@ class OAuth21SessionStore:
         with os.fdopen(fd, "r+", encoding="utf-8") as file_handle:
             fcntl.flock(file_handle.fileno(), fcntl.LOCK_EX)
             try:
-                oauth_states, cleaned_expired = self._load_oauth_states_from_file_handle(
-                    file_handle
+                oauth_states, cleaned_expired = (
+                    self._load_oauth_states_from_file_handle(file_handle)
                 )
                 result, mutated = mutator(oauth_states)
                 if cleaned_expired or mutated:
