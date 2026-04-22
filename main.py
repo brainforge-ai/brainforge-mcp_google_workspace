@@ -1,4 +1,6 @@
+import io
 import argparse
+import json
 import logging
 import os
 import socket
@@ -6,23 +8,66 @@ import sys
 from importlib import metadata, import_module
 from dotenv import load_dotenv
 
-# Check for CLI mode early - before loading oauth_config
-# CLI mode requires OAuth 2.0 since there's no MCP session context
-_CLI_MODE = "--cli" in sys.argv
-if _CLI_MODE:
-    os.environ["MCP_ENABLE_OAUTH21"] = "false"
-    os.environ["WORKSPACE_MCP_STATELESS_MODE"] = "false"
+# Prevent any stray startup output on macOS (e.g. platform identifiers) from
+# corrupting the MCP JSON-RPC handshake on stdout. We capture anything written
+# to stdout during module-level initialisation and replay it to stderr so that
+# diagnostic information is not lost.
+_original_stdout = sys.stdout
+if sys.platform == "darwin":
+    sys.stdout = io.StringIO()
 
-from auth.oauth_config import reload_oauth_config, is_stateless_mode  # noqa: E402
-from core.log_formatter import EnhancedLogFormatter, configure_file_logging  # noqa: E402
-from core.utils import check_credentials_directory_permissions  # noqa: E402
-from core.server import server, set_transport_mode, configure_server_for_http  # noqa: E402
-from core.tool_tier_loader import resolve_tools_from_tier  # noqa: E402
-from core.tool_registry import (  # noqa: E402
-    set_enabled_tools as set_enabled_tool_names,
+
+def _load_startup_dependencies():
+    from auth.oauth_config import (
+        get_oauth_config,
+        reload_oauth_config,
+        is_stateless_mode,
+        is_service_account_enabled,
+    )
+    from core.log_formatter import EnhancedLogFormatter, configure_file_logging
+    from core.utils import check_credentials_directory_permissions
+    from core.server import server, set_transport_mode, configure_server_for_http
+    from core.tool_tier_loader import resolve_tools_from_tier
+    from core.tool_registry import (
+        set_enabled_tools as set_enabled_tool_names,
+        wrap_server_tool_method,
+        filter_server_tools,
+    )
+
+    return (
+        get_oauth_config,
+        reload_oauth_config,
+        is_stateless_mode,
+        is_service_account_enabled,
+        EnhancedLogFormatter,
+        configure_file_logging,
+        check_credentials_directory_permissions,
+        server,
+        set_transport_mode,
+        configure_server_for_http,
+        resolve_tools_from_tier,
+        set_enabled_tool_names,
+        wrap_server_tool_method,
+        filter_server_tools,
+    )
+
+
+(
+    get_oauth_config,
+    reload_oauth_config,
+    is_stateless_mode,
+    is_service_account_enabled,
+    EnhancedLogFormatter,
+    configure_file_logging,
+    check_credentials_directory_permissions,
+    server,
+    set_transport_mode,
+    configure_server_for_http,
+    resolve_tools_from_tier,
+    set_enabled_tool_names,
     wrap_server_tool_method,
     filter_server_tools,
-)
+) = _load_startup_dependencies()
 
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=dotenv_path)
@@ -46,10 +91,6 @@ configure_file_logging()
 
 
 def safe_print(text):
-    # Don't print in CLI mode - we want clean output
-    if _CLI_MODE:
-        return
-
     # Don't print to stderr when running as MCP server via uvx to avoid JSON parsing errors
     # Check if we're running as MCP server (no TTY and uvx in process name)
     if not sys.stderr.isatty():
@@ -91,18 +132,61 @@ def configure_safe_logging():
             handler.setFormatter(safe_formatter)
 
 
+def resolve_permissions_mode_selection(
+    permission_services: list[str], tool_tier: str | None
+) -> tuple[list[str], set[str] | None]:
+    """
+    Resolve service imports and optional tool-name filtering for --permissions mode.
+
+    When a tier is specified, both:
+    - imported services are narrowed to services with tier-matched tools
+    - registered tools are narrowed to the resolved tool names
+    """
+    if tool_tier is None:
+        return permission_services, None
+
+    tier_tools, tier_services = resolve_tools_from_tier(tool_tier, permission_services)
+    return tier_services, set(tier_tools)
+
+
+def narrow_permissions_to_services(
+    permissions: dict[str, str], services: list[str]
+) -> dict[str, str]:
+    """Restrict permission entries to the provided service list order."""
+    return {
+        service: permissions[service] for service in services if service in permissions
+    }
+
+
+def _restore_stdout() -> None:
+    """Restore the real stdout and replay any captured output to stderr."""
+    captured_stdout = sys.stdout
+
+    # Idempotent: if already restored, nothing to do.
+    if captured_stdout is _original_stdout:
+        return
+
+    captured = ""
+    required_stringio_methods = ("getvalue", "write", "flush")
+    try:
+        if all(
+            callable(getattr(captured_stdout, method_name, None))
+            for method_name in required_stringio_methods
+        ):
+            captured = captured_stdout.getvalue()
+    finally:
+        sys.stdout = _original_stdout
+
+    if captured:
+        print(captured, end="", file=sys.stderr)
+
+
 def main():
     """
     Main entry point for the Google Workspace MCP server.
     Uses FastMCP's native streamable-http transport.
-    Supports CLI mode for direct tool invocation without running the server.
     """
-    # Check if CLI mode is enabled - suppress startup messages
-    if _CLI_MODE:
-        # Suppress logging output in CLI mode for clean output
-        logging.getLogger().setLevel(logging.ERROR)
-        logging.getLogger("auth").setLevel(logging.ERROR)
-        logging.getLogger("core").setLevel(logging.ERROR)
+    _restore_stdout()
 
     # Configure safe logging for Windows Unicode handling
     configure_safe_logging()
@@ -145,22 +229,39 @@ def main():
         help="Transport mode: stdio (default) or streamable-http",
     )
     parser.add_argument(
-        "--cli",
-        nargs=argparse.REMAINDER,
-        metavar="COMMAND",
-        help="Run in CLI mode for direct tool invocation. Use --cli to list tools, --cli <tool_name> to run a tool.",
-    )
-    parser.add_argument(
         "--read-only",
         action="store_true",
         help="Run in read-only mode - requests only read-only scopes and disables tools requiring write permissions",
     )
+    parser.add_argument(
+        "--permissions",
+        nargs="+",
+        metavar="SERVICE:LEVEL",
+        help=(
+            "Granular per-service permission levels. Format: service:level. "
+            "Example: --permissions gmail:organize drive:readonly. "
+            "Gmail levels: readonly, organize, drafts, send, full (cumulative). "
+            "Other services: readonly, full. "
+            "Mutually exclusive with --read-only and --tools."
+        ),
+    )
     args = parser.parse_args()
 
-    # Clean up CLI args - argparse.REMAINDER may include leading dashes from first arg
-    if args.cli is not None:
-        # Filter out empty strings that might appear
-        args.cli = [a for a in args.cli if a]
+    # Validate mutually exclusive flags
+    if args.permissions and args.read_only:
+        print(
+            "Error: --permissions and --read-only are mutually exclusive. "
+            "Use service:readonly within --permissions instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.permissions and args.tools is not None:
+        print(
+            "Error: --permissions and --tools cannot be combined. "
+            "Select services via --permissions (optionally with --tool-tier).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Set port and base URI once for reuse throughout the function
     port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", 8000)))
@@ -184,6 +285,8 @@ def main():
     safe_print(f"   👤 Mode: {'Single-user' if args.single_user else 'Multi-user'}")
     if args.read_only:
         safe_print("   🔒 Read-Only: Enabled")
+    if args.permissions:
+        safe_print("   🔒 Permissions: Granular mode")
     safe_print(f"   🐍 Python: {sys.version.split()[0]}")
     safe_print("")
 
@@ -227,6 +330,9 @@ def main():
             "OAUTHLIB_INSECURE_TRANSPORT", "false"
         ),
         "GOOGLE_CLIENT_SECRET_PATH": os.getenv("GOOGLE_CLIENT_SECRET_PATH", "Not Set"),
+        "GOOGLE_SERVICE_ACCOUNT_KEY_FILE": os.getenv(
+            "GOOGLE_SERVICE_ACCOUNT_KEY_FILE", "Not Set"
+        ),
     }
 
     for key, value in config_vars.items():
@@ -265,7 +371,36 @@ def main():
     }
 
     # Determine which tools to import based on arguments
-    if args.tool_tier is not None:
+    perms = None
+    if args.permissions:
+        # Granular permissions mode — parse and activate before tool selection
+        from auth.permissions import parse_permissions_arg, set_permissions
+
+        try:
+            perms = parse_permissions_arg(args.permissions)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        # Permissions implicitly defines which services to load
+        tools_to_import = list(perms.keys())
+        set_enabled_tool_names(None)
+
+        if args.tool_tier is not None:
+            # Combine with tier filtering within the permission-selected services
+            try:
+                tools_to_import, tier_tool_filter = resolve_permissions_mode_selection(
+                    tools_to_import, args.tool_tier
+                )
+                set_enabled_tool_names(tier_tool_filter)
+                perms = narrow_permissions_to_services(perms, tools_to_import)
+            except Exception as e:
+                print(
+                    f"Error loading tools for tier '{args.tool_tier}': {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        set_permissions(perms)
+    elif args.tool_tier is not None:
         # Use tier-based tool selection, optionally filtered by services
         try:
             tier_tools, suggested_services = resolve_tools_from_tier(
@@ -314,19 +449,15 @@ def main():
         except ModuleNotFoundError as exc:
             logger.error("Failed to import tool '%s': %s", tool, exc, exc_info=True)
             safe_print(f"   ⚠️ Failed to load {tool.title()} tool module ({exc}).")
+
+    if perms:
+        safe_print("🔒 Permission Levels:")
+        for svc, lvl in sorted(perms.items()):
+            safe_print(f"   {tool_icons.get(svc, '  ')} {svc}: {lvl}")
     safe_print("")
 
     # Filter tools based on tier configuration (if tier-based loading is enabled)
     filter_server_tools(server)
-
-    # Handle CLI mode - execute tool and exit
-    if args.cli is not None:
-        import asyncio
-        from core.cli_handler import handle_cli_mode
-
-        # CLI mode - run tool directly and exit
-        exit_code = asyncio.run(handle_cli_mode(server, args.cli))
-        sys.exit(exit_code)
 
     safe_print("📊 Configuration Summary:")
     safe_print(f"   🔧 Services Loaded: {len(tools_to_import)}/{len(tool_imports)}")
@@ -360,12 +491,65 @@ def main():
             safe_print("❌ Single-user mode is incompatible with stateless mode")
             safe_print("   Stateless mode requires OAuth 2.1 which is multi-user")
             sys.exit(1)
+
+        if is_service_account_enabled():
+            safe_print("❌ Single-user mode is incompatible with service account mode")
+            safe_print(
+                "   Service account mode handles auth via domain-wide delegation"
+            )
+            safe_print(
+                "   Please choose one mode: either --single-user OR GOOGLE_SERVICE_ACCOUNT_KEY_FILE"
+            )
+            sys.exit(1)
+
         os.environ["MCP_SINGLE_USER_MODE"] = "1"
         safe_print("🔐 Single-user mode enabled")
         safe_print("")
 
-    # Check credentials directory permissions before starting (skip in stateless mode)
-    if not is_stateless_mode():
+    # Service account mode startup validation
+    if is_service_account_enabled():
+        user_email = os.getenv("USER_GOOGLE_EMAIL")
+        if not user_email:
+            safe_print("❌ Service account mode requires USER_GOOGLE_EMAIL to be set")
+            safe_print("   Set USER_GOOGLE_EMAIL to the domain user to impersonate")
+            sys.exit(1)
+        # Validate service account key material before advertising readiness
+        sa_config = get_oauth_config()
+        try:
+            if sa_config.service_account_key_file:
+                with open(sa_config.service_account_key_file) as f:
+                    key_data = json.load(f)
+            else:
+                key_data = json.loads(sa_config.service_account_key_json)
+            required_fields = {"type", "project_id", "private_key", "client_email"}
+            missing = required_fields - set(key_data.keys())
+            if missing:
+                safe_print(
+                    f"❌ Service account key missing required fields: "
+                    f"{', '.join(sorted(missing))}"
+                )
+                sys.exit(1)
+            if key_data.get("type") != "service_account":
+                safe_print(
+                    f"❌ Service account key has unexpected type: "
+                    f"{key_data.get('type')!r}"
+                )
+                sys.exit(1)
+        except FileNotFoundError as e:
+            safe_print(f"❌ Service account key file not found: {e}")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            safe_print(f"❌ Service account key contains invalid JSON: {e}")
+            sys.exit(1)
+        except (IOError, OSError) as e:
+            safe_print(f"❌ Failed to read service account key: {e}")
+            sys.exit(1)
+        safe_print("🔐 Service account mode enabled (domain-wide delegation)")
+        safe_print(f"   Impersonating: {user_email}")
+        safe_print("")
+
+    # Check credentials directory permissions before starting (skip in stateless/service-account mode)
+    if not is_stateless_mode() and not is_service_account_enabled():
         try:
             safe_print("🔍 Checking credentials directory permissions...")
             check_credentials_directory_permissions()
@@ -379,7 +563,10 @@ def main():
             logger.error(f"Failed credentials directory permission check: {e}")
             sys.exit(1)
     else:
-        safe_print("🔍 Skipping credentials directory check (stateless mode)")
+        skip_reason = (
+            "stateless mode" if is_stateless_mode() else "service account mode"
+        )
+        safe_print(f"🔍 Skipping credentials directory check ({skip_reason})")
         safe_print("")
 
     try:
@@ -396,21 +583,22 @@ def main():
         else:
             safe_print("")
             safe_print("🚀 Starting STDIO server")
-            # Start minimal OAuth callback server for stdio mode
-            from auth.oauth_callback_server import ensure_oauth_callback_available
+            # Start minimal OAuth callback server for stdio mode (not needed for service accounts)
+            if not is_service_account_enabled():
+                from auth.oauth_callback_server import ensure_oauth_callback_available
 
-            success, error_msg = ensure_oauth_callback_available(
-                "stdio", port, base_uri
-            )
-            if success:
-                safe_print(
-                    f"   OAuth callback server started on {display_url}/oauth2callback"
+                success, error_msg = ensure_oauth_callback_available(
+                    "stdio", port, base_uri
                 )
-            else:
-                warning_msg = "   ⚠️  Warning: Failed to start OAuth callback server"
-                if error_msg:
-                    warning_msg += f": {error_msg}"
-                safe_print(warning_msg)
+                if success:
+                    safe_print(
+                        f"   OAuth callback server started on {display_url}/oauth2callback"
+                    )
+                else:
+                    warning_msg = "   ⚠️  Warning: Failed to start OAuth callback server"
+                    if error_msg:
+                        warning_msg += f": {error_msg}"
+                    safe_print(warning_msg)
 
         safe_print("✅ Ready for MCP connections")
         safe_print("")
@@ -427,7 +615,12 @@ def main():
                 )
                 sys.exit(1)
 
-            server.run(transport="streamable-http", host=host, port=port)
+            server.run(
+                transport="streamable-http",
+                host=host,
+                port=port,
+                stateless_http=is_stateless_mode(),
+            )
         else:
             server.run()
     except KeyboardInterrupt:
