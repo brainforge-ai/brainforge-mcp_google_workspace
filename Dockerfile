@@ -13,7 +13,9 @@ RUN pip install --no-cache-dir uv
 COPY . .
 
 # Install Python dependencies using uv sync
-RUN uv sync --frozen --no-dev --extra disk
+# - disk: on-disk OAuth proxy storage
+# - valkey: shared OAuth proxy storage (Redis/Valkey) for multi-replica deployments
+RUN uv sync --frozen --no-dev --extra disk --extra valkey
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app \
