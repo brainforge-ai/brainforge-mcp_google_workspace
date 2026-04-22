@@ -10,10 +10,15 @@ from starlette.middleware import Middleware
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
+from fastmcp.server.dependencies import get_access_token, get_context
 
 from auth.oauth21_session_store import get_oauth21_session_store, set_auth_provider
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
-from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+from auth.oauth_config import (
+    is_oauth21_enabled,
+    is_external_oauth21_provider,
+    is_stateless_mode,
+)
 from auth.mcp_session_middleware import MCPSessionMiddleware
 from auth.oauth_responses import (
     create_error_response,
@@ -28,6 +33,7 @@ from core.config import (
     set_transport_mode as _set_transport_mode,
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
+from core.url_resolver import resolve_google_url, ResolvedGoogleUrl
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -574,3 +580,63 @@ async def start_google_auth(
     except Exception as e:
         logger.error(f"Failed to start Google authentication flow: {e}", exc_info=True)
         return f"**Error:** An unexpected error occurred: {e}"
+
+
+@server.tool()
+async def whoami_google() -> dict:
+    """
+    Return diagnostic information about the active Google identity and server auth mode.
+
+    This tool is intentionally read-only and returns **no secrets** (no access tokens,
+    refresh tokens, or client secrets). It helps agents debug:
+    - Which user is authenticated (OAuth 2.1 multi-user)
+    - Whether the server is running in stateless mode / external OAuth provider mode
+    - Why `start_google_auth` may be unavailable
+    """
+    ctx = None
+    try:
+        ctx = get_context()
+    except Exception:
+        ctx = None
+
+    authenticated_user_email = None
+    authenticated_via = None
+    session_id = None
+    if ctx:
+        try:
+            authenticated_user_email = ctx.get_state("authenticated_user_email")
+            authenticated_via = ctx.get_state("authenticated_via")
+        except Exception:
+            authenticated_user_email = None
+            authenticated_via = None
+        session_id = getattr(ctx, "session_id", None)
+
+    has_validated_access_token = False
+    try:
+        has_validated_access_token = get_access_token() is not None
+    except Exception:
+        has_validated_access_token = False
+
+    return {
+        "authenticated_user_email": authenticated_user_email,
+        "authenticated_via": authenticated_via,
+        "fastmcp_session_id": session_id,
+        "oauth21_enabled": is_oauth21_enabled(),
+        "stateless_mode": is_stateless_mode(),
+        "external_oauth21_provider": is_external_oauth21_provider(),
+        "has_validated_access_token": has_validated_access_token,
+        "start_google_auth_available": not is_oauth21_enabled(),
+    }
+
+
+@server.tool()
+async def drive_resolve_url(url: str) -> ResolvedGoogleUrl:
+    """
+    Resolve common Google URLs (Docs/Sheets/Slides/Forms/Drive) into a resource type + id.
+
+    Returns:
+    - `resource_type`: doc|sheet|slide|form|script|drive_file|drive_folder|unknown
+    - `id`: extracted ID when present
+    - `original_url`: the input URL (trimmed)
+    """
+    return resolve_google_url(url)

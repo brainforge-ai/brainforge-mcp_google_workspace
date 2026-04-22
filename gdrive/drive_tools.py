@@ -45,6 +45,67 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
 UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 
+@server.tool()
+@handle_http_errors("check_access", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def check_access(
+    service,
+    user_google_email: str,
+    file_id: str,
+    supports_all_drives: bool = True,
+) -> Dict[str, Any]:
+    """
+    Preflight access check for a Drive file or folder.
+
+    This is a fast way to answer "do I have access?" before running multi-step flows.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): Drive file or folder ID.
+        supports_all_drives (bool): Whether to support Shared Drives. Defaults to True.
+
+    Returns:
+        Dict[str, Any]: A structured access summary (no secrets).
+    """
+    if not file_id:
+        raise ValueError("file_id is required")
+
+    fields = ",".join(
+        [
+            "id",
+            "name",
+            "mimeType",
+            "driveId",
+            "trashed",
+            "webViewLink",
+            "capabilities",
+        ]
+    )
+
+    item = await asyncio.to_thread(
+        service.files()
+        .get(fileId=file_id, fields=fields, supportsAllDrives=supports_all_drives)
+        .execute
+    )
+
+    caps = item.get("capabilities") or {}
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "mimeType": item.get("mimeType"),
+        "driveId": item.get("driveId"),
+        "trashed": item.get("trashed"),
+        "webViewLink": item.get("webViewLink"),
+        "capabilities": {
+            "canEdit": caps.get("canEdit"),
+            "canComment": caps.get("canComment"),
+            "canCopy": caps.get("canCopy"),
+            "canShare": caps.get("canShare"),
+            "canDownload": caps.get("canDownload"),
+            "canReadRevisions": caps.get("canReadRevisions"),
+        },
+    }
+
 
 @server.tool()
 @handle_http_errors("search_drive_files", is_read_only=True, service_type="drive")

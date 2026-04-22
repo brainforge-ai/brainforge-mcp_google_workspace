@@ -18,10 +18,13 @@ import inspect
 import json
 import logging
 import sys
+from importlib import import_module
 from typing import Any, Dict, List, Optional
 
 from auth.oauth_config import set_transport_mode
 from pydantic_core import PydanticUndefined as _PYDANTIC_UNDEFINED
+
+from core.errors import ToolExecutionError
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,7 @@ def _normalize_cli_args_for_tool(fn, args: Dict[str, Any]) -> Dict[str, Any]:
     return normalized_args
 
 
-def get_registered_tools(server) -> Dict[str, Any]:
+def _get_registered_tools_legacy(server) -> Dict[str, Any]:
     """
     Get all registered tools from the FastMCP server.
 
@@ -143,6 +146,36 @@ def get_registered_tools(server) -> Dict[str, Any]:
             }
 
     return tools
+
+
+async def get_registered_tools(server) -> Dict[str, Any]:
+    """
+    Get all registered tools from the FastMCP server.
+
+    FastMCP v3 exposes tools via `await server.list_tools()` and does not always
+    materialize an internal `_tool_manager`. Older versions used `_tool_manager._tools`.
+    """
+    try:
+        list_tools_fn = getattr(server, "list_tools", None)
+        if callable(list_tools_fn):
+            tools = {}
+            tool_objs = await server.list_tools()
+            for tool in tool_objs:
+                name = getattr(tool, "name", None)
+                if not name:
+                    continue
+                tools[name] = {
+                    "name": name,
+                    "description": getattr(tool, "description", None)
+                    or _extract_docstring(tool),
+                    "parameters": _extract_parameters(tool),
+                    "tool_obj": tool,
+                }
+            return tools
+    except Exception:
+        pass
+
+    return _get_registered_tools_legacy(server)
 
 
 def _extract_docstring(tool) -> Optional[str]:
@@ -181,7 +214,7 @@ def _extract_parameters(tool) -> Dict[str, Any]:
     return params
 
 
-def list_tools(server, output_format: str = "text") -> str:
+async def list_tools(server, output_format: str = "text") -> str:
     """
     List all available tools.
 
@@ -192,7 +225,7 @@ def list_tools(server, output_format: str = "text") -> str:
     Returns:
         Formatted string listing all tools
     """
-    tools = get_registered_tools(server)
+    tools = await get_registered_tools(server)
 
     if output_format == "json":
         # Return JSON format for programmatic use
@@ -240,7 +273,7 @@ def list_tools(server, output_format: str = "text") -> str:
     return "\n".join(lines)
 
 
-def show_tool_help(server, tool_name: str) -> str:
+async def show_tool_help(server, tool_name: str) -> str:
     """
     Show detailed help for a specific tool.
 
@@ -251,7 +284,7 @@ def show_tool_help(server, tool_name: str) -> str:
     Returns:
         Formatted help string for the tool
     """
-    tools = get_registered_tools(server)
+    tools = await get_registered_tools(server)
 
     if tool_name not in tools:
         available = ", ".join(sorted(tools.keys())[:10])
@@ -315,7 +348,7 @@ async def run_tool(server, tool_name: str, args: Dict[str, Any]) -> str:
     Returns:
         Tool result as a string
     """
-    tools = get_registered_tools(server)
+    tools = await get_registered_tools(server)
 
     if tool_name not in tools:
         raise ValueError(f"Tool '{tool_name}' not found")
@@ -359,6 +392,8 @@ async def run_tool(server, tool_name: str, args: Dict[str, Any]) -> str:
             f"Required parameters: {required}\n"
             f"Provided parameters: {list(call_args.keys())}"
         )
+    except ToolExecutionError:
+        raise
     except Exception as e:
         logger.error(f"[CLI] Error executing {tool_name}: {e}", exc_info=True)
         return f"Error: {type(e).__name__}: {e}"
@@ -383,6 +418,7 @@ def parse_cli_args(args: List[str]) -> Dict[str, Any]:
         "tool_name": None,
         "tool_args": {},
         "output_format": "text",
+        "output_path": None,
     }
 
     if not args:
@@ -395,9 +431,18 @@ def parse_cli_args(args: List[str]) -> Dict[str, Any]:
         if arg in ("list", "-l", "--list"):
             result["command"] = "list"
             i += 1
+        elif arg in ("export-tools", "--export-tools"):
+            result["command"] = "export-tools"
+            i += 1
         elif arg in ("--json", "-j"):
             result["output_format"] = "json"
             i += 1
+        elif arg in ("--md",):
+            result["output_format"] = "md"
+            i += 1
+        elif arg in ("--output", "-o") and i + 1 < len(args):
+            result["output_path"] = args[i + 1]
+            i += 2
         elif arg in ("help", "--help", "-h"):
             # Help command - if tool_name already set, show help for that tool
             if result["tool_name"]:
@@ -434,6 +479,53 @@ def parse_cli_args(args: List[str]) -> Dict[str, Any]:
             i += 1
 
     return result
+
+
+async def export_tools(server, output_format: str = "md") -> str:
+    """
+    Export registered tools to markdown or json for documentation/contract checks.
+    """
+    tools = await get_registered_tools(server)
+
+    if output_format == "json":
+        return await list_tools(server, output_format="json")
+
+    # Markdown
+    lines: list[str] = []
+    lines.append(f"# Tool Index ({len(tools)} tools)")
+    lines.append("")
+    lines.append("Generated from the server's registered tool schema.")
+    lines.append("")
+
+    for name in sorted(tools.keys()):
+        info = tools[name]
+        desc = (info.get("description") or "").strip()
+        params = info.get("parameters") or {}
+        lines.append(f"## `{name}`")
+        if desc:
+            lines.append("")
+            lines.append(desc.splitlines()[0])
+        lines.append("")
+        if not params:
+            lines.append("Parameters: _(none)_")
+            lines.append("")
+            continue
+        lines.append("Parameters:")
+        lines.append("")
+        lines.append("| Name | Type | Required | Default | Description |")
+        lines.append("|---|---|---:|---|---|")
+        for param_name, meta in params.items():
+            ptype = meta.get("type", "any")
+            required = "yes" if meta.get("required") else "no"
+            default = meta.get("default")
+            default_str = "" if default is None else str(default)
+            pdesc = (meta.get("description") or "").replace("\n", " ").strip()
+            lines.append(
+                f"| `{param_name}` | `{ptype}` | {required} | `{default_str}` | {pdesc} |"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def read_stdin_args() -> Dict[str, Any]:
@@ -473,16 +565,53 @@ async def handle_cli_mode(server, cli_args: List[str]) -> int:
     set_transport_mode("stdio")
 
     try:
+        # Ensure tool modules are imported in CLI mode.
+        # Some packaging/entrypoint flows can reach CLI mode without importing tool modules,
+        # resulting in an empty tool registry.
+        if not await get_registered_tools(server):
+            for module in (
+                "gmail.gmail_tools",
+                "gdrive.drive_tools",
+                "gcalendar.calendar_tools",
+                "gdocs.docs_tools",
+                "gsheets.sheets_tools",
+                "gchat.chat_tools",
+                "gforms.forms_tools",
+                "gslides.slides_tools",
+                "gtasks.tasks_tools",
+                "gcontacts.contacts_tools",
+                "gsearch.search_tools",
+                "gappsscript.apps_script_tools",
+            ):
+                try:
+                    import_module(module)
+                except Exception:
+                    # Best-effort: allow CLI to still work with whatever tools load.
+                    continue
+
         parsed = parse_cli_args(cli_args)
 
         if parsed["command"] == "list":
-            output = list_tools(server, parsed["output_format"])
+            output = await list_tools(server, parsed["output_format"])
             print(output)
             return 0
 
         if parsed["command"] == "help":
-            output = show_tool_help(server, parsed["tool_name"])
+            output = await show_tool_help(server, parsed["tool_name"])
             print(output)
+            return 0
+
+        if parsed["command"] == "export-tools":
+            fmt = parsed["output_format"]
+            if fmt not in ("json", "md"):
+                fmt = "md"
+            output = await export_tools(server, fmt)
+            if parsed["output_path"]:
+                with open(parsed["output_path"], "w", encoding="utf-8") as f:
+                    f.write(output)
+                print(parsed["output_path"])
+            else:
+                print(output)
             return 0
 
         if parsed["command"] == "run":
@@ -490,9 +619,13 @@ async def handle_cli_mode(server, cli_args: List[str]) -> int:
             args = read_stdin_args()
             args.update(parsed["tool_args"])
 
-            result = await run_tool(server, parsed["tool_name"], args)
-            print(result)
-            return 0
+            try:
+                result = await run_tool(server, parsed["tool_name"], args)
+                print(result)
+                return 0
+            except ToolExecutionError as e:
+                print(json.dumps({"ok": False, "error": e.payload}, indent=2, default=str))
+                return 1
 
         # Unknown command
         print(f"Unknown command: {parsed['command']}")

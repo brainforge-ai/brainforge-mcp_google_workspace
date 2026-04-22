@@ -13,6 +13,7 @@ from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+from core.errors import ToolExecutionError
 
 logger = logging.getLogger(__name__)
 
@@ -303,45 +304,88 @@ def handle_http_errors(
                         )
 
                         if enablement_msg:
-                            message = (
-                                f"API error in {tool_name}: {enablement_msg}\n\n"
-                                f"User: {user_google_email}"
-                            )
+                            raise ToolExecutionError(
+                                {
+                                    "kind": "server_misconfigured",
+                                    "message": enablement_msg,
+                                    "recommended_action": "Enable the required Google API in the Cloud Console, then retry.",
+                                    "details": {
+                                        "tool_name": tool_name,
+                                        "service_type": service_type,
+                                        "user_google_email": user_google_email,
+                                        "http_status": error.resp.status,
+                                    },
+                                }
+                            ) from error
                         else:
-                            message = (
-                                f"API error in {tool_name}: {error}. "
-                                f"The required API is not enabled for your project. "
-                                f"Please check the Google Cloud Console to enable it."
-                            )
+                            raise ToolExecutionError(
+                                {
+                                    "kind": "server_misconfigured",
+                                    "message": "The required Google API appears to be disabled for this project.",
+                                    "recommended_action": "Enable the required Google API in the Cloud Console, then retry.",
+                                    "details": {
+                                        "tool_name": tool_name,
+                                        "service_type": service_type,
+                                        "user_google_email": user_google_email,
+                                        "http_status": error.resp.status,
+                                        "error": error_details,
+                                    },
+                                }
+                            ) from error
                     elif error.resp.status in [401, 403]:
                         # Authentication/authorization errors
                         if is_oauth21_enabled():
                             if is_external_oauth21_provider():
-                                auth_hint = (
-                                    "LLM: Ask the user to provide a valid OAuth 2.1 "
-                                    "bearer token in the Authorization header and retry."
+                                recommended_action = (
+                                    "Authenticate by providing a valid OAuth 2.1 bearer token in the Authorization header, then retry."
                                 )
                             else:
-                                auth_hint = (
-                                    "LLM: Ask the user to authenticate via their MCP "
-                                    "client's OAuth 2.1 flow and retry."
+                                recommended_action = (
+                                    "Authenticate via your MCP client's OAuth 2.1 flow, then retry."
                                 )
                         else:
-                            auth_hint = (
-                                "LLM: Try 'start_google_auth' with the user's email "
-                                "and the appropriate service_name."
+                            recommended_action = (
+                                "Run start_google_auth with the user's email and the appropriate service_name, then retry."
                             )
-                        message = (
-                            f"API error in {tool_name}: {error}. "
-                            f"You might need to re-authenticate for user '{user_google_email}'. "
-                            f"{auth_hint}"
+
+                        kind = (
+                            "permission_denied"
+                            if error.resp.status == 403
+                            else "auth_required"
                         )
+                        raise ToolExecutionError(
+                            {
+                                "kind": kind,
+                                "message": f"Google API returned {error.resp.status} for {tool_name}.",
+                                "recommended_action": recommended_action,
+                                "details": {
+                                    "tool_name": tool_name,
+                                    "service_type": service_type,
+                                    "user_google_email": user_google_email,
+                                    "http_status": error.resp.status,
+                                    "error": error_details,
+                                },
+                            }
+                        ) from error
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
-                        message = f"API error in {tool_name}: {error}"
+                        raise ToolExecutionError(
+                            {
+                                "kind": "upstream_error",
+                                "message": f"Google API error in {tool_name}.",
+                                "recommended_action": "Check the input parameters and retry. If it persists, inspect server logs for details.",
+                                "details": {
+                                    "tool_name": tool_name,
+                                    "service_type": service_type,
+                                    "user_google_email": user_google_email,
+                                    "http_status": error.resp.status,
+                                    "error": error_details,
+                                },
+                            }
+                        ) from error
 
                     logger.error(f"API error in {tool_name}: {error}", exc_info=True)
-                    raise Exception(message) from error
+                    raise
                 except TransientNetworkError:
                     # Re-raise without wrapping to preserve the specific error type
                     raise
@@ -351,7 +395,17 @@ def handle_http_errors(
                 except Exception as e:
                     message = f"An unexpected error occurred in {tool_name}: {e}"
                     logger.exception(message)
-                    raise Exception(message) from e
+                    raise ToolExecutionError(
+                        {
+                            "kind": "unknown",
+                            "message": message,
+                            "recommended_action": "Retry once. If it persists, inspect server logs for details.",
+                            "details": {
+                                "tool_name": tool_name,
+                                "service_type": service_type,
+                            },
+                        }
+                    ) from e
 
         # Propagate _required_google_scopes if present (for tool filtering)
         if hasattr(func, "_required_google_scopes"):

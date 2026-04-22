@@ -652,6 +652,7 @@ workspace-mcp --cli [command] [options]
 | Command | Description |
 |---------|-------------|
 | `list` (default) | List all available tools |
+| `export-tools` | Export tool index (markdown by default; add `--json` for JSON) |
 | `<tool_name>` | Execute the specified tool |
 | `<tool_name> --help` | Show detailed help for a tool |
 
@@ -666,6 +667,21 @@ workspace-mcp --cli [command] [options]
 ```bash
 # List all Gmail tools
 workspace-mcp --cli list | grep gmail
+
+# Export a markdown tool index to stdout
+workspace-mcp --cli export-tools
+
+# Export a JSON tool index (good for contract checks)
+workspace-mcp --cli export-tools --json
+
+# Export a markdown tool index to a file
+workspace-mcp --cli export-tools --output tools.md
+
+# Diagnostics: show active auth identity + mode (no secrets)
+workspace-mcp --cli whoami_google
+
+# Resolve a Google URL to a type + id
+workspace-mcp --cli drive_resolve_url --args '{"url":"https://docs.google.com/document/d/abc123/edit"}'
 
 # Search for unread emails
 workspace-mcp --cli search_gmail_messages --args '{"query": "is:unread", "max_results": 5}'
@@ -686,6 +702,11 @@ workspace-mcp --cli list --json | jq '.tools[] | select(.name | contains("gmail"
 - Results are printed to stdout; errors go to stderr
 - Exit code 0 on success, 1 on error
 
+## OAuth 2.1 vs `start_google_auth` (important)
+
+- When **OAuth 2.1 is enabled** (`MCP_ENABLE_OAUTH21=true`), the server expects **protocol-level auth** from the MCP client and tools like `start_google_auth` are **disabled**.
+- Use `whoami_google` to confirm what identity/auth mode the server sees, then authenticate via your MCP client's OAuth flow and retry the original tool.
+
 </details>
 
 </details>
@@ -693,6 +714,20 @@ workspace-mcp --cli list --json | jq '.tools[] | select(.name | contains("gmail"
 ### Tool Tiers
 
 The server organizes tools into **three progressive tiers** for simplified deployment. Choose a tier that matches your usage needs and API quota requirements.
+
+## Local testing
+
+Run unit tests in a clean virtualenv:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -U pip setuptools wheel
+pip install -e '.[test]'
+pytest -q
+```
+
+Note: `pytest.ini` restricts discovery to `test_*.py` so manual scripts like `tests/gappsscript/manual_test.py` are not collected by default.
 
 <table>
 <tr>
@@ -1174,6 +1209,11 @@ uv run pytest
 
 The server includes OAuth 2.1 support for bearer token authentication, enabling multi-user session management. **OAuth 2.1 automatically reuses your existing `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` credentials** - no additional configuration needed!
 
+**Recommended default for teams:** If your goal is “people install the MCP and then auth”, prefer running the server in OAuth 2.1 mode over legacy “pass `user_google_email`” mode. In OAuth 2.1 mode:
+- Users authenticate via their MCP client's OAuth flow
+- Tools should not require passing `user_google_email` (the server infers identity from protocol auth)
+- Legacy `start_google_auth` is disabled by design
+
 **When to use OAuth 2.1:**
 - Multiple users accessing the same MCP server instance
 - Need for bearer token authentication instead of passing user emails
@@ -1195,6 +1235,8 @@ To enable OAuth 2.1, set the `MCP_ENABLE_OAUTH21` environment variable to `true`
 ```bash
 # OAuth 2.1 requires HTTP transport mode
 export MCP_ENABLE_OAUTH21=true
+# Optional but recommended for hosted deployments:
+export WORKSPACE_MCP_STATELESS_MODE=true
 uv run main.py --transport streamable-http
 ```
 
