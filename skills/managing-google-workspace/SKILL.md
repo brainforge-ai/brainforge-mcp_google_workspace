@@ -147,12 +147,17 @@ For parameters: [references/docs.md](references/docs.md)
 | Task | Tool |
 |------|------|
 | Read cell values | `read_sheet_values` |
-| Write/append/clear values | `modify_sheet_values` |
+| Write/clear values | `modify_sheet_values` |
+| Batch write multiple ranges | `batch_modify_sheet_values` |
+| Replace a table (clear, then write) | `replace_table` |
 | Format cells | `format_sheet_range` |
 | Conditional formatting | `manage_conditional_formatting` |
-| Get spreadsheet info | `get_spreadsheet_info` |
+| Get spreadsheet info (tabs, gid, hidden) | `get_spreadsheet_info` |
 | Create spreadsheet | `create_spreadsheet` |
 | Create sheet (tab) | `create_sheet` |
+| Delete / rename / hide a tab | `delete_sheet` / `rename_sheet` / `hide_sheet` |
+| List structured tables | `list_sheet_tables` |
+| Append table rows (retry-safe: `dedupe_column`) | `append_table_rows` |
 | List spreadsheets | `list_spreadsheets` |
 | Comments | `manage_spreadsheet_comment` / `list_spreadsheet_comments` |
 

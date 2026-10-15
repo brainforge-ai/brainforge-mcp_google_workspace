@@ -8,6 +8,7 @@ import logging
 import asyncio
 import json
 import copy
+import re
 from typing import List, Optional, Union
 
 from auth.service_decorator import require_google_service
@@ -17,6 +18,7 @@ from core.comments import create_comment_tools
 from gsheets.sheets_helpers import (
     CONDITION_TYPES,
     _a1_range_for_values,
+    _column_index_to_letter,
     _column_to_index,
     _build_boolean_rule,
     _build_gradient_rule,
@@ -1383,6 +1385,7 @@ async def append_table_rows(
     spreadsheet_id: str,
     table_id: str,
     values: Union[str, List[List]],
+    dedupe_column: Optional[str] = None,
 ) -> str:
     """
     Appends rows to a structured table in a Google Sheet. The rows are added
@@ -1396,6 +1399,9 @@ async def append_table_rows(
         table_id (str): The ID of the table to append to (get from list_sheet_tables). Required.
         values (Union[str, List[List]]): 2D array of values to append. Each inner
             list is one row. Can be a JSON string or Python list. Required.
+        dedupe_column (Optional[str]): Name of a table column to deduplicate on. When
+            set, rows whose value in that column already exists in the table are
+            skipped, making the append safe to retry. Defaults to None (no dedupe).
 
     Returns:
         str: Confirmation message with the number of rows appended.
@@ -1440,6 +1446,18 @@ async def append_table_rows(
             f"Use list_sheet_tables to find valid table IDs."
         )
 
+    skipped = 0
+    if dedupe_column:
+        values, skipped = await _filter_duplicate_rows(
+            service, spreadsheet_id, table_id, dedupe_column, values
+        )
+        if not values:
+            return (
+                f"No rows appended to table '{table_id}' in spreadsheet "
+                f"{spreadsheet_id}: all {skipped} row(s) already present by "
+                f"'{dedupe_column}'."
+            )
+
     # Build cell data for appendCells
     rows = []
     for row_values in values:
@@ -1477,6 +1495,8 @@ async def append_table_rows(
         f"Successfully appended {num_rows} row(s) to table '{table_id}' "
         f"in spreadsheet {spreadsheet_id} for {user_google_email}."
     )
+    if skipped:
+        text_output += f" Skipped {skipped} duplicate row(s) by '{dedupe_column}'."
 
     logger.info(f"[append_table_rows] Appended {num_rows} rows for {user_google_email}")
     return text_output
@@ -1821,6 +1841,182 @@ async def batch_modify_sheet_values(
     logger.info(
         f"[batch_modify_sheet_values] Updated {result['total_cells_updated']} cells "
         f"for {user_google_email}."
+    )
+    return text_output
+
+
+async def _filter_duplicate_rows(
+    service,
+    spreadsheet_id: str,
+    table_id: str,
+    dedupe_column: str,
+    values: List[List],
+) -> tuple[List[List], int]:
+    """Drop rows whose dedupe-column value already exists in the table.
+
+    Returns (kept_rows, skipped_count). Makes append_table_rows safe to retry.
+    """
+    meta = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId,title),tables(tableId,range,columnProperties))",
+        )
+        .execute
+    )
+    sheet_title = None
+    table_range = {}
+    columns = []
+    for s in meta.get("sheets", []):
+        for t in s.get("tables", []):
+            if t.get("tableId") == table_id:
+                sheet_title = s.get("properties", {}).get("title")
+                table_range = t.get("range", {}) or {}
+                columns = [
+                    c.get("columnName", "") for c in t.get("columnProperties", [])
+                ]
+    if sheet_title is None or not columns:
+        return values, 0
+
+    idx = next(
+        (i for i, c in enumerate(columns) if c.lower() == dedupe_column.lower()),
+        None,
+    )
+    if idx is None:
+        raise UserInputError(
+            f"dedupe_column '{dedupe_column}' not found in table '{table_id}'. "
+            f"Columns: {', '.join(columns)}."
+        )
+
+    start_col = table_range.get("startColumnIndex", 0)
+    letter = _column_index_to_letter(start_col + idx)
+    quoted = (
+        sheet_title
+        if re.fullmatch(r"[A-Za-z0-9_]+", sheet_title)
+        else "'" + sheet_title.replace("'", "''") + "'"
+    )
+    resp = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{quoted}!{letter}2:{letter}")
+        .execute
+    )
+    existing = {
+        str(cell) for row in resp.get("values", []) for cell in row if cell != ""
+    }
+
+    kept = []
+    skipped = 0
+    for row in values:
+        if idx < len(row) and str(row[idx]) in existing:
+            skipped += 1
+            continue
+        kept.append(row)
+    return kept, skipped
+
+
+async def _replace_table_impl(
+    service,
+    spreadsheet_id: str,
+    range_name: str,
+    values: Union[str, List[List]],
+    value_input_option: str = "USER_ENTERED",
+) -> dict:
+    if isinstance(values, str):
+        try:
+            values = json.loads(values)
+        except json.JSONDecodeError as e:
+            raise UserInputError(f"Invalid JSON format for values: {e}")
+    if not values or not isinstance(values, list):
+        raise UserInputError("'values' must be a non-empty 2D list of cell values.")
+    for r, row in enumerate(values):
+        if not isinstance(row, list):
+            raise UserInputError(
+                f"Row {r} must be a list; expected a 2D array of cell values."
+            )
+
+    upper = str(value_input_option).upper()
+    if upper not in ("RAW", "USER_ENTERED"):
+        raise UserInputError("value_input_option must be 'RAW' or 'USER_ENTERED'.")
+
+    try:
+        cleared = await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .clear(spreadsheetId=spreadsheet_id, range=range_name)
+            .execute
+        )
+    except Exception as exc:
+        if _is_range_parse_error(exc):
+            raise UserInputError(
+                f"{exc}"
+                + await _tab_name_suggestions(service, spreadsheet_id, range_name)
+            ) from exc
+        raise
+
+    updated = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption=upper,
+            body={"values": values},
+        )
+        .execute
+    )
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "range_name": range_name,
+        "cleared_range": cleared.get("clearedRange", range_name),
+        "updated_cells": updated.get("updatedCells", 0),
+        "updated_rows": updated.get("updatedRows", 0),
+    }
+
+
+@server.tool()
+@handle_http_errors("replace_table", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def replace_table(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    range_name: str,
+    values: Union[str, List[List]],
+    value_input_option: str = "USER_ENTERED",
+) -> str:
+    """
+    Replaces a table: clears the range, then writes the new values.
+
+    Clearing first means a shorter replacement cannot leave stale trailing
+    cells behind, which a plain write would (invisibly to a later read).
+    Two API calls, one tool.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        range_name (str): A1-style range for the table body (e.g. "Sheet1!A1:D20"). Required.
+        values (Union[str, List[List]]): 2D array of replacement values. Can be a
+            JSON string or a Python list. Required.
+        value_input_option (str): "RAW" or "USER_ENTERED". Defaults to "USER_ENTERED".
+
+    Returns:
+        str: Confirmation message with the cells and rows written.
+    """
+    logger.info(
+        f"[replace_table] Invoked. Email: '{user_google_email}', "
+        f"Spreadsheet: {spreadsheet_id}, Range: {range_name}"
+    )
+    result = await _replace_table_impl(
+        service, spreadsheet_id, range_name, values, value_input_option
+    )
+    text_output = (
+        f"Successfully replaced range '{result['range_name']}' in spreadsheet "
+        f"{spreadsheet_id} for {user_google_email}. "
+        f"Updated: {result['updated_cells']} cells, {result['updated_rows']} rows."
+    )
+    logger.info(
+        f"[replace_table] Updated {result['updated_cells']} cells for {user_google_email}."
     )
     return text_output
 

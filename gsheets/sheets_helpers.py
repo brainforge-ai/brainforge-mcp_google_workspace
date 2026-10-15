@@ -31,6 +31,18 @@ def _column_to_index(column: str) -> Optional[int]:
     return result - 1
 
 
+def _column_index_to_letter(index: int) -> str:
+    """Convert a zero-based column index to A1 letters (0 -> A, 26 -> AA)."""
+    if index < 0:
+        raise UserInputError(f"Column index must be >= 0, got {index}.")
+    letters = ""
+    n = index + 1
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
+
+
 def _parse_a1_part(
     part: str, pattern: re.Pattern[str] = A1_PART_REGEX
 ) -> tuple[Optional[int], Optional[int]]:

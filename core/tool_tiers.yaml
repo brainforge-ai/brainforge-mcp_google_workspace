@@ -85,6 +85,7 @@ sheets:
     - format_sheet_range
     - list_sheet_tables
     - batch_modify_sheet_values
+    - replace_table
   complete:
     - create_sheet
     - delete_sheet
