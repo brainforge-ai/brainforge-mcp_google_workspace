@@ -117,7 +117,7 @@ async def get_spreadsheet_info(
         service.spreadsheets()
         .get(
             spreadsheetId=spreadsheet_id,
-            fields="spreadsheetId,properties(title,locale),sheets(properties(title,sheetId,gridProperties(rowCount,columnCount)),conditionalFormats)",
+            fields="spreadsheetId,properties(title,locale),sheets(properties(title,sheetId,hidden,gridProperties(rowCount,columnCount)),conditionalFormats)",
         )
         .execute
     )
@@ -144,8 +144,11 @@ async def get_spreadsheet_info(
         cols = grid_props.get("columnCount", "Unknown")
         rules = sheet.get("conditionalFormats", []) or []
 
+        hidden = sheet_props.get("hidden", False)
+        visibility = " | hidden: yes" if hidden else ""
         sheets_info.append(
-            f'  - "{sheet_name}" (ID: {sheet_id}) | Size: {rows}x{cols} | Conditional formats: {len(rules)}'
+            f'  - "{sheet_name}" (gid: {sheet_id}) | Size: {rows}x{cols}'
+            f"{visibility} | Conditional formats: {len(rules)}"
         )
         if rules:
             sheets_info.append(
@@ -180,6 +183,7 @@ async def read_sheet_values(
     include_hyperlinks: bool = False,
     include_notes: bool = False,
     include_formulas: bool = False,
+    include_sheet_state: bool = False,
 ) -> str:
     """
     Reads values from a specific range in a Google Sheet.
@@ -195,6 +199,10 @@ async def read_sheet_values(
         include_formulas (bool): If True, also fetch raw formula strings for cells that
             contain formulas. Useful for identifying cross-sheet references before writing
             back to a range. Defaults to False to avoid an extra API request.
+        include_sheet_state (bool): If True, also return the current tab inventory
+            (gid, title, hidden) so a caller can detect a structural edit (a tab
+            added, renamed, or hidden) between reads. Defaults to False to avoid an
+            extra API request.
 
     Returns:
         str: The formatted values from the specified range.
@@ -213,6 +221,25 @@ async def read_sheet_values(
     values = result.get("values", [])
     resolved_range = result.get("range", range_name)
 
+    state_note = ""
+    if include_sheet_state:
+        meta = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets(properties(sheetId,title,hidden))",
+            )
+            .execute
+        )
+        tabs = []
+        for s in meta.get("sheets", []):
+            props = s.get("properties", {}) or {}
+            label = f"{props.get('sheetId')}:{props.get('title')}"
+            if props.get("hidden"):
+                label += " (hidden)"
+            tabs.append(label)
+        state_note = "\nsheet_state: " + ", ".join(tabs)
+
     hyperlink_section, notes_section = await _fetch_grid_metadata(
         service,
         spreadsheet_id,
@@ -230,7 +257,10 @@ async def read_sheet_values(
         )
 
     if not values and not formula_values:
-        return f"No data found in range '{range_name}' for {user_google_email}."
+        return (
+            f"No data found in range '{range_name}' for {user_google_email}."
+            + state_note
+        )
 
     if not values:
         logger.info(
@@ -241,6 +271,7 @@ async def read_sheet_values(
             f"No displayed values found in range '{range_name}' in spreadsheet {spreadsheet_id} "
             f"for {user_google_email}. The range contains formula cells."
             + formula_section
+            + state_note
         )
 
     detailed_range = _a1_range_for_values(resolved_range, values) or resolved_range
@@ -281,6 +312,7 @@ async def read_sheet_values(
         + notes_section
         + formula_section
         + detailed_errors_section
+        + state_note
     )
 
 
@@ -1421,6 +1453,349 @@ async def append_table_rows(
     )
 
     logger.info(f"[append_table_rows] Appended {num_rows} rows for {user_google_email}")
+    return text_output
+
+
+async def _resolve_sheet_id(
+    service, spreadsheet_id: str, sheet: Union[str, int]
+) -> int:
+    """Resolve a tab title (or numeric sheetId) to a stable sheetId.
+
+    Titles are volatile (they get renamed); the numeric sheetId is not. Callers
+    may pass either, so structure tools never depend on a title staying put.
+    """
+    if isinstance(sheet, bool):
+        raise UserInputError("'sheet' must be a tab title or numeric sheetId.")
+    if isinstance(sheet, (int, float)):
+        return int(sheet)
+
+    # Resolve strings by title first, so a tab literally named "2024" is not
+    # mistaken for gid 2024; fall back to a numeric sheetId only when no title matches.
+    title = str(sheet)
+    spreadsheet = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title,sheetId))",
+        )
+        .execute
+    )
+    for s in spreadsheet.get("sheets", []):
+        props = s.get("properties", {})
+        if props.get("title") == title:
+            return props["sheetId"]
+
+    if title.strip().isdigit():
+        return int(title)
+
+    available = ", ".join(
+        repr(s.get("properties", {}).get("title", "?"))
+        for s in spreadsheet.get("sheets", [])
+    )
+    raise UserInputError(
+        f"Sheet '{title}' not found in spreadsheet {spreadsheet_id}. "
+        f"Available tabs: {available or 'none'}. "
+        "Call get_spreadsheet_info to confirm current tab names."
+    )
+
+
+async def _delete_sheet_impl(
+    service, spreadsheet_id: str, sheet: Union[str, int]
+) -> dict:
+    sheet_id = await _resolve_sheet_id(service, spreadsheet_id, sheet)
+    await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"deleteSheet": {"sheetId": sheet_id}}]},
+        )
+        .execute
+    )
+    return {"spreadsheet_id": spreadsheet_id, "sheet_id": sheet_id, "sheet": sheet}
+
+
+async def _rename_sheet_impl(
+    service, spreadsheet_id: str, sheet: Union[str, int], new_name: str
+) -> dict:
+    if not new_name or not str(new_name).strip():
+        raise UserInputError("'new_name' must be a non-empty tab title.")
+    sheet_id = await _resolve_sheet_id(service, spreadsheet_id, sheet)
+    await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {"sheetId": sheet_id, "title": new_name},
+                            "fields": "title",
+                        }
+                    }
+                ]
+            },
+        )
+        .execute
+    )
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "sheet_id": sheet_id,
+        "old_name": sheet,
+        "new_name": new_name,
+    }
+
+
+async def _hide_sheet_impl(
+    service, spreadsheet_id: str, sheet: Union[str, int], hidden: bool = True
+) -> dict:
+    sheet_id = await _resolve_sheet_id(service, spreadsheet_id, sheet)
+    await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": sheet_id,
+                                "hidden": bool(hidden),
+                            },
+                            "fields": "hidden",
+                        }
+                    }
+                ]
+            },
+        )
+        .execute
+    )
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "sheet_id": sheet_id,
+        "sheet": sheet,
+        "hidden": bool(hidden),
+    }
+
+
+async def _batch_modify_sheet_values_impl(
+    service,
+    spreadsheet_id: str,
+    data: Union[str, List[dict]],
+    value_input_option: str = "USER_ENTERED",
+) -> dict:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError as e:
+            raise UserInputError(f"Invalid JSON format for data: {e}")
+    if not isinstance(data, list) or not data:
+        raise UserInputError(
+            "'data' must be a non-empty list of {range_name, values} objects."
+        )
+
+    value_ranges = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict) or "range_name" not in entry:
+            raise UserInputError(
+                f"Entry {i} must be an object with 'range_name' and a 2D 'values' list."
+            )
+        values = entry.get("values")
+        if not values or not isinstance(values, list):
+            raise UserInputError(
+                f"Entry {i} ('{entry.get('range_name')}') must include a non-empty "
+                "2D 'values' list."
+            )
+        for r, row in enumerate(values):
+            if not isinstance(row, list):
+                raise UserInputError(
+                    f"Entry {i} ('{entry.get('range_name')}') row {r} must be a list; "
+                    "expected a 2D array of cell values."
+                )
+        value_ranges.append({"range": entry["range_name"], "values": values})
+
+    upper = str(value_input_option).upper()
+    if upper not in ("RAW", "USER_ENTERED"):
+        raise UserInputError("value_input_option must be 'RAW' or 'USER_ENTERED'.")
+
+    result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": upper, "data": value_ranges},
+        )
+        .execute
+    )
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "value_input_option": upper,
+        "ranges": [v["range"] for v in value_ranges],
+        "total_cells_updated": result.get("totalUpdatedCells", 0),
+    }
+
+
+@server.tool()
+@handle_http_errors("delete_sheet", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def delete_sheet(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet: Union[str, int],
+) -> str:
+    """
+    Deletes a whole tab (sheet) from a spreadsheet.
+
+    Accepts the tab title or its numeric sheetId. Deleting a tab removes all of
+    its content; the recipient's access is unchanged. Cannot delete the last
+    remaining visible tab (the API rejects it).
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        sheet (Union[str, int]): The tab title or numeric sheetId to delete. Required.
+
+    Returns:
+        str: Confirmation message of the successful deletion.
+    """
+    logger.info(
+        f"[delete_sheet] Invoked. Email: '{user_google_email}', "
+        f"Spreadsheet: {spreadsheet_id}, Sheet: {sheet}"
+    )
+    result = await _delete_sheet_impl(service, spreadsheet_id, sheet)
+    text_output = (
+        f"Successfully deleted sheet '{result['sheet']}' "
+        f"(sheetId {result['sheet_id']}) in spreadsheet {spreadsheet_id} "
+        f"for {user_google_email}."
+    )
+    logger.info(f"[delete_sheet] Deleted sheet for {user_google_email}.")
+    return text_output
+
+
+@server.tool()
+@handle_http_errors("rename_sheet", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def rename_sheet(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet: Union[str, int],
+    new_name: str,
+) -> str:
+    """
+    Renames an existing tab (sheet) in a spreadsheet.
+
+    Accepts the current tab title or its numeric sheetId. Renaming keeps the
+    sheetId stable, so ranges addressed by gid or by the new title both work.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        sheet (Union[str, int]): The current tab title or numeric sheetId. Required.
+        new_name (str): The new tab title. Required.
+
+    Returns:
+        str: Confirmation message of the successful rename.
+    """
+    logger.info(
+        f"[rename_sheet] Invoked. Email: '{user_google_email}', "
+        f"Spreadsheet: {spreadsheet_id}, Sheet: {sheet}, New name: {new_name}"
+    )
+    result = await _rename_sheet_impl(service, spreadsheet_id, sheet, new_name)
+    text_output = (
+        f"Successfully renamed sheet '{result['old_name']}' to "
+        f"'{result['new_name']}' (sheetId {result['sheet_id']}) in spreadsheet "
+        f"{spreadsheet_id} for {user_google_email}."
+    )
+    logger.info(f"[rename_sheet] Renamed sheet for {user_google_email}.")
+    return text_output
+
+
+@server.tool()
+@handle_http_errors("hide_sheet", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def hide_sheet(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet: Union[str, int],
+    hidden: bool = True,
+) -> str:
+    """
+    Hides or unhides a whole tab (sheet) in a spreadsheet.
+
+    Accepts the tab title or its numeric sheetId. Hidden tabs stay in the file
+    and keep their data; set hidden=False to show the tab again.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        sheet (Union[str, int]): The tab title or numeric sheetId. Required.
+        hidden (bool): True to hide the tab, False to show it. Defaults to True.
+
+    Returns:
+        str: Confirmation message of the successful visibility change.
+    """
+    logger.info(
+        f"[hide_sheet] Invoked. Email: '{user_google_email}', "
+        f"Spreadsheet: {spreadsheet_id}, Sheet: {sheet}, Hidden: {hidden}"
+    )
+    result = await _hide_sheet_impl(service, spreadsheet_id, sheet, hidden)
+    state = "hidden" if result["hidden"] else "visible"
+    text_output = (
+        f"Successfully set sheet '{result['sheet']}' (sheetId {result['sheet_id']}) "
+        f"to {state} in spreadsheet {spreadsheet_id} for {user_google_email}."
+    )
+    logger.info(f"[hide_sheet] Updated visibility for {user_google_email}.")
+    return text_output
+
+
+@server.tool()
+@handle_http_errors("batch_modify_sheet_values", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def batch_modify_sheet_values(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    data: Union[str, List[dict]],
+    value_input_option: str = "USER_ENTERED",
+) -> str:
+    """
+    Writes or updates many ranges in a single API request.
+
+    Each entry is an object with `range_name` and a 2D `values` list, e.g.
+    [{"range_name": "Sheet1!A1:B2", "values": [["a", "b"], ["c", "d"]]}].
+    One request, applied atomically, and cheaper against the Sheets quota than
+    several modify_sheet_values calls.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        data (Union[str, List[dict]]): List of {range_name, values} objects. Can be
+            a JSON string or a Python list. Required.
+        value_input_option (str): How to interpret input values across the whole
+            batch ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
+
+    Returns:
+        str: Confirmation message with the ranges written and cells updated.
+    """
+    logger.info(
+        f"[batch_modify_sheet_values] Invoked. Email: '{user_google_email}', "
+        f"Spreadsheet: {spreadsheet_id}, Ranges: "
+        f"{len(data) if isinstance(data, list) else 'json'}"
+    )
+    result = await _batch_modify_sheet_values_impl(
+        service, spreadsheet_id, data, value_input_option
+    )
+    text_output = (
+        f"Successfully updated {len(result['ranges'])} range(s) "
+        f"({result['total_cells_updated']} cell(s)) in spreadsheet "
+        f"{spreadsheet_id} for {user_google_email}: {', '.join(result['ranges'])}."
+    )
+    logger.info(
+        f"[batch_modify_sheet_values] Updated {result['total_cells_updated']} cells "
+        f"for {user_google_email}."
+    )
     return text_output
 
 
