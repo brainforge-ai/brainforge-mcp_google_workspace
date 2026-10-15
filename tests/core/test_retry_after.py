@@ -41,7 +41,9 @@ def test_retry_after_seconds_http_date_returns_none():
 
 
 def test_retry_after_seconds_non_finite_returns_none():
-    assert _retry_after_seconds(HttpError(_resp(429, {"retry-after": "inf"}), b"")) is None
+    assert (
+        _retry_after_seconds(HttpError(_resp(429, {"retry-after": "inf"}), b"")) is None
+    )
 
 
 def test_retry_after_seconds_no_resp_returns_none():
