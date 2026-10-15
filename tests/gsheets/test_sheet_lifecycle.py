@@ -19,6 +19,8 @@ from gsheets.sheets_tools import (
     _rename_sheet_impl,
     _hide_sheet_impl,
     _batch_modify_sheet_values_impl,
+    _replace_table_impl,
+    _filter_duplicate_rows,
 )
 
 
@@ -177,3 +179,76 @@ async def test_batch_modify_non_2d_row_raises():
         await _batch_modify_sheet_values_impl(
             service, "ss", [{"range_name": "A1", "values": ["a", "b"]}]
         )
+
+
+@pytest.mark.asyncio
+async def test_replace_table_clears_then_writes():
+    service = Mock()
+    service.spreadsheets().values().clear().execute = Mock(
+        return_value={"clearedRange": "Sheet1!A1:B10"}
+    )
+    service.spreadsheets().values().update().execute = Mock(
+        return_value={"updatedCells": 4, "updatedRows": 2}
+    )
+    result = await _replace_table_impl(
+        service, "ss", "Sheet1!A1:B2", [["a", "b"], ["c", "d"]]
+    )
+    assert service.spreadsheets().values().clear.called
+    assert service.spreadsheets().values().update.called
+    assert result["updated_cells"] == 4
+    assert result["cleared_range"] == "Sheet1!A1:B10"
+
+
+@pytest.mark.asyncio
+async def test_replace_table_non_2d_raises():
+    service = create_mock_service()
+    with pytest.raises(UserInputError):
+        await _replace_table_impl(service, "ss", "Sheet1!A1", ["a", "b"])
+
+
+def _table_service(existing_values, column_name="Email"):
+    service = Mock()
+    service.spreadsheets().get().execute = Mock(
+        return_value={
+            "sheets": [
+                {
+                    "properties": {"sheetId": 0, "title": "Contacts"},
+                    "tables": [
+                        {
+                            "tableId": "t1",
+                            "range": {"startColumnIndex": 0},
+                            "columnProperties": [
+                                {"columnName": "Email"},
+                                {"columnName": "Name"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    service.spreadsheets().values().get().execute = Mock(
+        return_value={"values": [[v] for v in existing_values]}
+    )
+    return service
+
+
+@pytest.mark.asyncio
+async def test_filter_duplicate_rows_skips_existing():
+    service = _table_service(["a@x.com"])
+    kept, skipped = await _filter_duplicate_rows(
+        service,
+        "ss",
+        "t1",
+        "Email",
+        [["a@x.com", "A"], ["b@x.com", "B"]],
+    )
+    assert skipped == 1
+    assert kept == [["b@x.com", "B"]]
+
+
+@pytest.mark.asyncio
+async def test_filter_duplicate_rows_unknown_column_raises():
+    service = _table_service([])
+    with pytest.raises(UserInputError):
+        await _filter_duplicate_rows(service, "ss", "t1", "Nope", [["v"]])
