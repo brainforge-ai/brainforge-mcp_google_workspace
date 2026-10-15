@@ -7,6 +7,7 @@ import zipfile
 import ssl
 import asyncio
 import functools
+import math
 
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
@@ -530,9 +531,13 @@ def _retry_after_seconds(error) -> Optional[float]:
     if not raw:
         return None
     try:
-        return float(str(raw).strip())
+        value = float(str(raw).strip())
     except (TypeError, ValueError):
         return None
+    return value if math.isfinite(value) else None
+
+
+MAX_RETRY_DELAY = 30
 
 
 def handle_http_errors(
@@ -591,7 +596,7 @@ def handle_http_errors(
                         retry_after = _retry_after_seconds(error)
                         if is_read_only and attempt < max_retries - 1:
                             delay = (
-                                retry_after
+                                max(0.0, min(retry_after, MAX_RETRY_DELAY))
                                 if retry_after is not None
                                 else base_delay * (2**attempt)
                             )
@@ -606,10 +611,15 @@ def handle_http_errors(
                             if retry_after is not None
                             else ""
                         )
+                        limits = (
+                            " Sheets limits are 300 reads + 300 writes/min/project "
+                            "and 60 + 60/min/user."
+                            if service_type == "sheets"
+                            else ""
+                        )
                         message = (
                             f"API error in {tool_name}: quota or transient availability "
-                            f"(HTTP {error.resp.status}).{hint} Back off and retry; Sheets "
-                            f"limits are 300 reads + 300 writes/min/project and 60 + 60/min/user. "
+                            f"(HTTP {error.resp.status}).{hint} Back off and retry.{limits} "
                             f"{error}"
                         )
                         logger.error(

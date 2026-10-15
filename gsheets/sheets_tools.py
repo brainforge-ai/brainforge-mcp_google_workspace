@@ -117,7 +117,7 @@ async def get_spreadsheet_info(
         service.spreadsheets()
         .get(
             spreadsheetId=spreadsheet_id,
-            fields="spreadsheetId,properties(title,locale,revisionId),sheets(properties(title,sheetId,hidden,gridProperties(rowCount,columnCount)),conditionalFormats)",
+            fields="spreadsheetId,properties(title,locale),sheets(properties(title,sheetId,hidden,gridProperties(rowCount,columnCount)),conditionalFormats)",
         )
         .execute
     )
@@ -125,7 +125,6 @@ async def get_spreadsheet_info(
     properties = spreadsheet.get("properties", {})
     title = properties.get("title", "Unknown")
     locale = properties.get("locale", "Unknown")
-    revision_id = properties.get("revisionId", "Unknown")
     sheets = spreadsheet.get("sheets", [])
 
     sheet_titles = {}
@@ -161,8 +160,7 @@ async def get_spreadsheet_info(
     sheets_section = "\n".join(sheets_info) if sheets_info else "  No sheets found"
     text_output = "\n".join(
         [
-            f'Spreadsheet: "{title}" (ID: {spreadsheet_id}) | Locale: {locale} '
-            f"| revisionId: {revision_id}",
+            f'Spreadsheet: "{title}" (ID: {spreadsheet_id}) | Locale: {locale}',
             f"Sheets ({len(sheets)}):",
             sheets_section,
         ]
@@ -185,7 +183,7 @@ async def read_sheet_values(
     include_hyperlinks: bool = False,
     include_notes: bool = False,
     include_formulas: bool = False,
-    include_revision: bool = False,
+    include_sheet_state: bool = False,
 ) -> str:
     """
     Reads values from a specific range in a Google Sheet.
@@ -201,9 +199,10 @@ async def read_sheet_values(
         include_formulas (bool): If True, also fetch raw formula strings for cells that
             contain formulas. Useful for identifying cross-sheet references before writing
             back to a range. Defaults to False to avoid an extra API request.
-        include_revision (bool): If True, also return the spreadsheet's current
-            revisionId so a caller can detect a concurrent edit between reads.
-            Defaults to False to avoid an extra API request.
+        include_sheet_state (bool): If True, also return the current tab inventory
+            (gid, title, hidden) so a caller can detect a structural edit (a tab
+            added, renamed, or hidden) between reads. Defaults to False to avoid an
+            extra API request.
 
     Returns:
         str: The formatted values from the specified range.
@@ -222,20 +221,24 @@ async def read_sheet_values(
     values = result.get("values", [])
     resolved_range = result.get("range", range_name)
 
-    revision_note = ""
-    if include_revision:
+    state_note = ""
+    if include_sheet_state:
         meta = await asyncio.to_thread(
             service.spreadsheets()
             .get(
                 spreadsheetId=spreadsheet_id,
-                fields="spreadsheetId,properties(revisionId)",
+                fields="sheets(properties(sheetId,title,hidden))",
             )
             .execute
         )
-        revision_note = (
-            f"\nrevisionId: "
-            f"{meta.get('properties', {}).get('revisionId', 'Unknown')}"
-        )
+        tabs = []
+        for s in meta.get("sheets", []):
+            props = s.get("properties", {}) or {}
+            label = f"{props.get('sheetId')}:{props.get('title')}"
+            if props.get("hidden"):
+                label += " (hidden)"
+            tabs.append(label)
+        state_note = "\nsheet_state: " + ", ".join(tabs)
 
     hyperlink_section, notes_section = await _fetch_grid_metadata(
         service,
@@ -254,7 +257,10 @@ async def read_sheet_values(
         )
 
     if not values and not formula_values:
-        return f"No data found in range '{range_name}' for {user_google_email}."
+        return (
+            f"No data found in range '{range_name}' for {user_google_email}."
+            + state_note
+        )
 
     if not values:
         logger.info(
@@ -265,6 +271,7 @@ async def read_sheet_values(
             f"No displayed values found in range '{range_name}' in spreadsheet {spreadsheet_id} "
             f"for {user_google_email}. The range contains formula cells."
             + formula_section
+            + state_note
         )
 
     detailed_range = _a1_range_for_values(resolved_range, values) or resolved_range
@@ -305,7 +312,7 @@ async def read_sheet_values(
         + notes_section
         + formula_section
         + detailed_errors_section
-        + revision_note
+        + state_note
     )
 
 
@@ -1459,11 +1466,11 @@ async def _resolve_sheet_id(
     """
     if isinstance(sheet, bool):
         raise UserInputError("'sheet' must be a tab title or numeric sheetId.")
-    if isinstance(sheet, (int, float)) or (
-        isinstance(sheet, str) and sheet.strip().isdigit()
-    ):
+    if isinstance(sheet, (int, float)):
         return int(sheet)
 
+    # Resolve strings by title first, so a tab literally named "2024" is not
+    # mistaken for gid 2024; fall back to a numeric sheetId only when no title matches.
     title = str(sheet)
     spreadsheet = await asyncio.to_thread(
         service.spreadsheets()
@@ -1477,6 +1484,9 @@ async def _resolve_sheet_id(
         props = s.get("properties", {})
         if props.get("title") == title:
             return props["sheetId"]
+
+    if title.strip().isdigit():
+        return int(title)
 
     available = ", ".join(
         repr(s.get("properties", {}).get("title", "?"))
@@ -1595,6 +1605,12 @@ async def _batch_modify_sheet_values_impl(
                 f"Entry {i} ('{entry.get('range_name')}') must include a non-empty "
                 "2D 'values' list."
             )
+        for r, row in enumerate(values):
+            if not isinstance(row, list):
+                raise UserInputError(
+                    f"Entry {i} ('{entry.get('range_name')}') row {r} must be a list; "
+                    "expected a 2D array of cell values."
+                )
         value_ranges.append({"range": entry["range_name"], "values": values})
 
     upper = str(value_input_option).upper()

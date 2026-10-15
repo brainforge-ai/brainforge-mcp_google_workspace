@@ -153,3 +153,27 @@ async def test_batch_modify_bad_value_input_option_raises():
         await _batch_modify_sheet_values_impl(
             service, "ss", [{"range_name": "A1", "values": [["x"]]}], "NOPE"
         )
+
+
+@pytest.mark.asyncio
+async def test_resolve_sheet_id_title_wins_over_numeric():
+    service = create_mock_service(
+        sheets=[{"properties": {"sheetId": 99, "title": "2024"}}]
+    )
+    assert await _resolve_sheet_id(service, "ss", "2024") == 99
+
+
+@pytest.mark.asyncio
+async def test_resolve_sheet_id_bool_raises():
+    service = create_mock_service()
+    with pytest.raises(UserInputError):
+        await _resolve_sheet_id(service, "ss", True)
+
+
+@pytest.mark.asyncio
+async def test_batch_modify_non_2d_row_raises():
+    service = create_mock_service()
+    with pytest.raises(UserInputError):
+        await _batch_modify_sheet_values_impl(
+            service, "ss", [{"range_name": "A1", "values": ["a", "b"]}]
+        )
