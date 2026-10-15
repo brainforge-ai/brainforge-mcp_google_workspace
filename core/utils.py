@@ -506,6 +506,35 @@ def encode_image_content(file_bytes: bytes, mime_type: str) -> str:
     return f"[base64_image:{mime_type}]{encoded}"
 
 
+def _retry_after_seconds(error) -> Optional[float]:
+    """Extract a Retry-After delay (seconds) from an HttpError, if present.
+
+    Google returns Retry-After as seconds for quota errors. An HTTP-date form or
+    a missing header yields None, so callers fall back to exponential backoff.
+    """
+    resp = getattr(error, "resp", None)
+    if resp is None:
+        return None
+    raw = None
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            raw = None
+    if raw is None:
+        try:
+            raw = resp.get("retry-after")
+        except Exception:
+            raw = None
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def handle_http_errors(
     tool_name: str, is_read_only: bool = False, service_type: Optional[str] = None
 ):
@@ -556,6 +585,37 @@ def handle_http_errors(
                 except HttpError as error:
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
+
+                    # Quota / transient availability: respect Retry-After and back off.
+                    if error.resp.status in (429, 503):
+                        retry_after = _retry_after_seconds(error)
+                        if is_read_only and attempt < max_retries - 1:
+                            delay = (
+                                retry_after
+                                if retry_after is not None
+                                else base_delay * (2**attempt)
+                            )
+                            logger.warning(
+                                f"Quota error (HTTP {error.resp.status}) in {tool_name} "
+                                f"on attempt {attempt + 1}. Retrying in {delay}s..."
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        hint = (
+                            f" Retry after ~{retry_after}s."
+                            if retry_after is not None
+                            else ""
+                        )
+                        message = (
+                            f"API error in {tool_name}: quota or transient availability "
+                            f"(HTTP {error.resp.status}).{hint} Back off and retry; Sheets "
+                            f"limits are 300 reads + 300 writes/min/project and 60 + 60/min/user. "
+                            f"{error}"
+                        )
+                        logger.error(
+                            f"Quota error in {tool_name}: {error}", exc_info=True
+                        )
+                        raise Exception(message) from error
 
                     # Check if this is an API not enabled error
                     if (
