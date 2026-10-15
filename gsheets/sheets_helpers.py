@@ -71,6 +71,61 @@ def _split_sheet_and_range(range_name: str) -> tuple[Optional[str], str]:
     return sheet_name.strip().strip("'"), a1_range
 
 
+def _is_range_parse_error(exc: Exception) -> bool:
+    """True when a Sheets error is a stale or unknown tab title in an A1 range.
+
+    Sheets returns HTTP 400 'Unable to parse range: <title>!<cells>' when the tab
+    named in a range is gone or was renamed.
+    """
+    return "unable to parse range" in str(exc).lower()
+
+
+async def _tab_name_suggestions(service, spreadsheet_id: str, range_name: str) -> str:
+    """Name the current tabs (and the closest match) when a range's tab is stale.
+
+    Turns the opaque 'Unable to parse range' failure into a self-correcting hint
+    the caller can act on. Returns a suffix string, empty when nothing useful can
+    be added.
+    """
+    sheet_name, _ = _split_sheet_and_range(range_name)
+    if not sheet_name:
+        return ""
+    try:
+        meta = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets(properties(title))",
+            )
+            .execute
+        )
+    except Exception:
+        return ""
+
+    titles = [s.get("properties", {}).get("title", "") for s in meta.get("sheets", [])]
+    titles = [t for t in titles if t]
+    if not titles:
+        return ""
+
+    def _norm(t: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", t.lower())
+
+    target = _norm(sheet_name)
+    close = [t for t in titles if target and (target in _norm(t) or _norm(t) in target)]
+
+    parts = [f"Tab '{sheet_name}' was not found in this spreadsheet."]
+    if close:
+        parts.append(
+            "Closest current tab(s): " + ", ".join(repr(c) for c in close) + "."
+        )
+    parts.append("Current tabs: " + ", ".join(repr(t) for t in titles) + ".")
+    parts.append(
+        "The tab may have been renamed; call get_spreadsheet_info and retry with "
+        "the current title."
+    )
+    return "\n" + " ".join(parts)
+
+
 def _parse_a1_range(range_name: str, sheets: List[dict]) -> dict:
     """
     Convert an A1-style range (with optional sheet name) into a GridRange.
