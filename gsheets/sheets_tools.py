@@ -26,11 +26,13 @@ from gsheets.sheets_helpers import (
     _fetch_sheets_with_rules,
     _format_conditional_rules_section,
     _format_sheet_error_section,
+    _is_range_parse_error,
     _parse_a1_range,
     _parse_condition_values,
     _parse_gradient_points,
     _parse_hex_color,
     _select_sheet,
+    _tab_name_suggestions,
     _values_contain_sheets_errors,
 )
 
@@ -211,12 +213,20 @@ async def read_sheet_values(
         f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}"
     )
 
-    result = await asyncio.to_thread(
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=range_name)
-        .execute
-    )
+    try:
+        result = await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=range_name)
+            .execute
+        )
+    except Exception as exc:
+        if _is_range_parse_error(exc):
+            raise UserInputError(
+                f"{exc}"
+                + await _tab_name_suggestions(service, spreadsheet_id, range_name)
+            ) from exc
+        raise
 
     values = result.get("values", [])
     resolved_range = result.get("range", range_name)
@@ -376,12 +386,20 @@ async def modify_sheet_values(
         )
 
     if clear_values:
-        result = await asyncio.to_thread(
-            service.spreadsheets()
-            .values()
-            .clear(spreadsheetId=spreadsheet_id, range=range_name)
-            .execute
-        )
+        try:
+            result = await asyncio.to_thread(
+                service.spreadsheets()
+                .values()
+                .clear(spreadsheetId=spreadsheet_id, range=range_name)
+                .execute
+            )
+        except Exception as exc:
+            if _is_range_parse_error(exc):
+                raise UserInputError(
+                    f"{exc}"
+                    + await _tab_name_suggestions(service, spreadsheet_id, range_name)
+                ) from exc
+            raise
 
         cleared_range = result.get("clearedRange", range_name)
         text_output = f"Successfully cleared range '{cleared_range}' in spreadsheet {spreadsheet_id} for {user_google_email}."
@@ -391,21 +409,29 @@ async def modify_sheet_values(
     else:
         body = {"values": values}
 
-        result = await asyncio.to_thread(
-            service.spreadsheets()
-            .values()
-            .update(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption=value_input_option,
-                # NOTE: This increases response payload/shape by including `updatedData`, but lets
-                # us detect Sheets error tokens (e.g. "#VALUE!", "#REF!") without an extra read.
-                includeValuesInResponse=True,
-                responseValueRenderOption="FORMATTED_VALUE",
-                body=body,
+        try:
+            result = await asyncio.to_thread(
+                service.spreadsheets()
+                .values()
+                .update(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name,
+                    valueInputOption=value_input_option,
+                    # NOTE: This increases response payload/shape by including `updatedData`, but lets
+                    # us detect Sheets error tokens (e.g. "#VALUE!", "#REF!") without an extra read.
+                    includeValuesInResponse=True,
+                    responseValueRenderOption="FORMATTED_VALUE",
+                    body=body,
+                )
+                .execute
             )
-            .execute
-        )
+        except Exception as exc:
+            if _is_range_parse_error(exc):
+                raise UserInputError(
+                    f"{exc}"
+                    + await _tab_name_suggestions(service, spreadsheet_id, range_name)
+                ) from exc
+            raise
 
         updated_cells = result.get("updatedCells", 0)
         updated_rows = result.get("updatedRows", 0)
