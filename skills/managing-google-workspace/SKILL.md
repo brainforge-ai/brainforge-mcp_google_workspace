@@ -271,7 +271,7 @@ Parameters: `user_google_email` (string, optional), `service_name` (string, requ
 ### Reply to an email
 1. `search_gmail_messages` -- find the email
 2. `get_gmail_message_content` -- read it (get `message_id` and `thread_id`)
-3. `send_gmail_message` -- reply using `in_reply_to` and `thread_id`
+3. `send_gmail_message` -- reply using `in_reply_to` and `thread_id`, with `confirm_send=true`
 
 ### Find and share a file
 1. `search_drive_files` -- find the file

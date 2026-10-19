@@ -799,6 +799,7 @@ async def test_send_gmail_message_with_url_attachment(monkeypatch):
         subject="URL attachment test",
         body="See attached from URL.",
         attachments=[{"url": "https://example.com/doc.pdf", "filename": "doc.pdf"}],
+        confirm_send=True,
     )
 
     assert "Email sent with 1 attachment(s)! Message ID: msg_url" in result
