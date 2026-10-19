@@ -6,6 +6,7 @@ to simplify the implementation of document editing tools.
 """
 
 import logging
+import re
 from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
@@ -805,7 +806,7 @@ def create_format_text_request(
         small_caps,
     )
 
-    if not text_style:
+    if not text_style and not fields:
         return None
 
     return {
@@ -1762,3 +1763,196 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
             )
 
     return True, ""
+
+
+def _iter_document_tabs(tabs: list):
+    """Yield each tab, including nested child tabs."""
+    for tab in tabs:
+        yield tab
+        yield from _iter_document_tabs(tab.get("childTabs", []))
+
+
+def revision_failure_message(error: Exception) -> Optional[str]:
+    """Return actionable text when a Docs write fails a revision check."""
+    text = str(error)
+    raw_content = getattr(error, "content", None)
+    if raw_content:
+        try:
+            text += " " + raw_content.decode("utf-8", "replace")
+        except (AttributeError, UnicodeDecodeError):
+            pass
+
+    lowered = text.lower()
+    is_revision_failure = "revision" in lowered or "precondition" in lowered
+    marker_found = any(
+        marker in lowered
+        for marker in (
+            "required revision",
+            "requiredrevisionid",
+            "changed since",
+            "precondition",
+            "failed_precondition",
+            "mismatch",
+            "does not match",
+        )
+    )
+    if is_revision_failure and marker_found:
+        return (
+            "The document changed since the revision used to find the match. "
+            "Re-read the document and retry. "
+            f"Original error: {text}"
+        )
+    return None
+
+
+def get_doc_body_content(
+    doc: Dict[str, Any], tab_id: Optional[str] = None
+) -> Optional[list]:
+    """Return content for a tab, the first tab, or the legacy body.
+
+    Returns None when an explicit tab_id is not found, so callers can tell a
+    missing tab from a tab with no matching text.
+    """
+    tabs = doc.get("tabs", [])
+    if tab_id:
+        for tab in _iter_document_tabs(tabs):
+            if tab.get("tabProperties", {}).get("tabId") == tab_id:
+                return tab.get("documentTab", {}).get("body", {}).get("content", [])
+        return None
+    if tabs:
+        first = next(iter(_iter_document_tabs(tabs)))
+        return first.get("documentTab", {}).get("body", {}).get("content", [])
+    return doc.get("body", {}).get("content", [])
+
+
+def _utf16_width(char: str) -> int:
+    """Return the Docs index width of a character (UTF-16 code units)."""
+    return 2 if ord(char) > 0xFFFF else 1
+
+
+def _collect_text_runs(content: list) -> list[tuple[int, str]]:
+    """Collect text runs as (startIndex, text), including table cells.
+
+    Table of contents entries duplicate heading text, so they are skipped.
+    """
+    runs: list[tuple[int, str]] = []
+
+    def walk(items: list) -> None:
+        for element in items:
+            if "paragraph" in element:
+                for item in element["paragraph"].get("elements", []):
+                    if "textRun" in item:
+                        runs.append(
+                            (
+                                item.get("startIndex", 0),
+                                item["textRun"].get("content", ""),
+                            )
+                        )
+            elif "table" in element:
+                for row in element["table"].get("tableRows", []):
+                    for cell in row.get("tableCells", []):
+                        walk(cell.get("content", []))
+
+    walk(content)
+    return runs
+
+
+def find_text_range_in_content(
+    content: list,
+    match_text: str,
+    occurrence: int = 1,
+    match_case: bool = False,
+) -> Optional[tuple[int, int]]:
+    """Find a text match and return its absolute (startIndex, endIndex).
+
+    Docs indexes are UTF-16 code units, so the offset table counts surrogate
+    pairs as two units. Case-insensitive matching runs on the original string
+    to preserve offsets.
+    """
+    if not match_text:
+        return None
+
+    runs = _collect_text_runs(content)
+    if not runs:
+        return None
+
+    combined = ""
+    doc_indices: list[int] = []
+    for start_index, text in runs:
+        utf16_offset = 0
+        for char in text:
+            doc_indices.append(start_index + utf16_offset)
+            utf16_offset += _utf16_width(char)
+        combined += text
+
+    if len(doc_indices) != len(combined):
+        return None
+
+    matches: list[tuple[int, int]] = []
+    if match_case:
+        cursor = combined.find(match_text)
+        while cursor != -1:
+            matches.append((cursor, cursor + len(match_text)))
+            cursor = combined.find(match_text, cursor + 1)
+    else:
+        for match in re.finditer(re.escape(match_text), combined, re.IGNORECASE):
+            matches.append((match.start(), match.end()))
+
+    if occurrence < 1 or occurrence > len(matches):
+        return None
+
+    start_char, end_char = matches[occurrence - 1]
+    if end_char <= start_char:
+        return None
+
+    start = doc_indices[start_char]
+    last_char = end_char - 1
+    end = doc_indices[last_char] + _utf16_width(combined[last_char])
+    return start, end
+
+
+def find_paragraph_range_in_content(
+    content: list,
+    match_text: str,
+    occurrence: int = 1,
+    match_case: bool = False,
+) -> Optional[tuple[int, int]]:
+    """Find the paragraph containing a text match and return its index range."""
+    if not match_text:
+        return None
+
+    paragraphs: list[tuple[int, int, str]] = []
+
+    def walk(items: list) -> None:
+        for element in items:
+            if "paragraph" in element:
+                text = "".join(
+                    item["textRun"].get("content", "")
+                    for item in element["paragraph"].get("elements", [])
+                    if "textRun" in item
+                )
+                paragraphs.append(
+                    (
+                        element.get("startIndex", 0),
+                        element.get("endIndex", 0),
+                        text,
+                    )
+                )
+            elif "table" in element:
+                for row in element["table"].get("tableRows", []):
+                    for cell in row.get("tableCells", []):
+                        walk(cell.get("content", []))
+
+    walk(content)
+
+    found = 0
+    for start, end, text in paragraphs:
+        if match_case:
+            matched = match_text in text
+        else:
+            matched = bool(re.search(re.escape(match_text), text, re.IGNORECASE))
+        if matched:
+            found += 1
+            if found == occurrence:
+                return start, end
+    return None

@@ -2148,6 +2148,18 @@
         },
         "type": "array"
       },
+      "required_revision_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional revision guard. The write is rejected when\n        the document has moved past this revision. Use the revision ID\n        returned by a read or a previous write."
+      },
       "user_google_email": {
         "description": "User's Google email address",
         "type": "string"
@@ -2157,6 +2169,433 @@
       "user_google_email",
       "document_id",
       "operations"
+    ],
+    "type": "object"
+  },
+  "format_doc_paragraph_by_match": {
+    "additionalProperties": false,
+    "properties": {
+      "alignment": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "avoid_widow_and_orphan": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "direction": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "document_id": {
+        "type": "string"
+      },
+      "heading_level": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "indent_end": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "indent_first_line": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "indent_start": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "keep_lines_together": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "keep_with_next": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "line_spacing": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "match_case": {
+        "default": false,
+        "description": "Whether the match is case-sensitive.",
+        "type": "boolean"
+      },
+      "match_text": {
+        "description": "Text inside the target paragraph.",
+        "type": "string"
+      },
+      "named_style_type": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "occurrence": {
+        "default": 1,
+        "description": "Which matching paragraph to format, starting at 1.",
+        "type": "integer"
+      },
+      "page_break_before": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "required_revision_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional revision guard. The write fails if the\ndocument changed after this revision."
+      },
+      "shading_color": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "space_above": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "space_below": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "spacing_mode": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "tab_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "user_google_email": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "user_google_email",
+      "document_id",
+      "match_text"
+    ],
+    "type": "object"
+  },
+  "format_doc_text_by_match": {
+    "additionalProperties": false,
+    "properties": {
+      "background_color": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "baseline_offset": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "bold": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "clear_link": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "document_id": {
+        "type": "string"
+      },
+      "font_family": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "font_size": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "font_weight": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "italic": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "link_url": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "match_case": {
+        "default": false,
+        "description": "Whether the match is case-sensitive.",
+        "type": "boolean"
+      },
+      "match_text": {
+        "description": "Text to find.",
+        "type": "string"
+      },
+      "occurrence": {
+        "default": 1,
+        "description": "Which match to format, starting at 1.",
+        "type": "integer"
+      },
+      "required_revision_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional revision guard. The write fails if the\ndocument changed after this revision."
+      },
+      "small_caps": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "strikethrough": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "tab_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "text_color": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "underline": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "user_google_email": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "user_google_email",
+      "document_id",
+      "match_text"
     ],
     "type": "object"
   },

@@ -35,6 +35,10 @@ from gdocs.docs_helpers import (
     create_delete_doc_tab_request,
     validate_suggestions_view_mode,
     create_update_paragraph_style_request,
+    get_doc_body_content,
+    find_text_range_in_content,
+    find_paragraph_range_in_content,
+    revision_failure_message,
 )
 
 # Import document structure and table utilities
@@ -735,6 +739,235 @@ async def find_and_replace_doc(
 
 
 @server.tool()
+@handle_http_errors("format_doc_text_by_match", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def format_doc_text_by_match(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    match_text: str,
+    occurrence: int = 1,
+    match_case: bool = False,
+    bold: Optional[bool] = None,
+    italic: Optional[bool] = None,
+    underline: Optional[bool] = None,
+    strikethrough: Optional[bool] = None,
+    font_size: Optional[int] = None,
+    font_family: Optional[str] = None,
+    font_weight: Optional[int] = None,
+    text_color: Optional[str] = None,
+    background_color: Optional[str] = None,
+    link_url: Optional[str] = None,
+    clear_link: Optional[bool] = None,
+    baseline_offset: Optional[str] = None,
+    small_caps: Optional[bool] = None,
+    tab_id: Optional[str] = None,
+    required_revision_id: Optional[str] = None,
+) -> str:
+    """
+    Apply inline text formatting to the Nth occurrence of a text match.
+
+    Use this instead of computing indexes with inspect_doc_structure when the
+    target text is unique or you know its occurrence number.
+
+    Args:
+        match_text: Text to find.
+        occurrence: Which match to format, starting at 1.
+        match_case: Whether the match is case-sensitive.
+        required_revision_id: Optional revision guard. The write fails if the
+            document changed after this revision.
+        Remaining arguments: standard text style fields.
+
+    Returns:
+        str: Confirmation with the matched index range.
+    """
+    if not match_text or not match_text.strip():
+        return "Error: match_text is required."
+    if occurrence < 1:
+        return "Error: occurrence must be 1 or greater."
+
+    doc = await asyncio.to_thread(
+        service.documents()
+        .get(documentId=document_id, includeTabsContent=True)
+        .execute
+    )
+    content = get_doc_body_content(doc, tab_id)
+    if content is None:
+        return f"Error: Tab '{tab_id}' was not found in document {document_id}."
+    match_range = find_text_range_in_content(
+        content, match_text, occurrence, match_case
+    )
+    if not match_range:
+        return (
+            f"Error: Text '{match_text}' occurrence {occurrence} was not found "
+            f"in document {document_id}."
+        )
+
+    start_index, end_index = match_range
+    request = create_format_text_request(
+        start_index,
+        end_index,
+        bold=bold,
+        italic=italic,
+        underline=underline,
+        strikethrough=strikethrough,
+        font_size=font_size,
+        font_family=font_family,
+        font_weight=font_weight,
+        text_color=text_color,
+        background_color=background_color,
+        link_url=link_url,
+        clear_link=clear_link,
+        baseline_offset=baseline_offset,
+        small_caps=small_caps,
+        tab_id=tab_id,
+    )
+    if not request:
+        return "Error: provide at least one formatting option."
+
+    revision_id = required_revision_id or doc.get("revisionId")
+    body: dict[str, Any] = {"requests": [request]}
+    if revision_id:
+        body["writeControl"] = {"requiredRevisionId": revision_id}
+
+    try:
+        await asyncio.to_thread(
+            service.documents()
+            .batchUpdate(documentId=document_id, body=body)
+            .execute
+        )
+    except Exception as exc:
+        revision_error = revision_failure_message(exc)
+        if revision_error:
+            return f"Error: {revision_error}"
+        raise
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    return (
+        f"Formatted occurrence {occurrence} of '{match_text}' at indexes "
+        f"{start_index}-{end_index} in document {document_id}. "
+        f"Revision used: {revision_id or 'none'}. Link: {link}"
+    )
+
+
+@server.tool()
+@handle_http_errors("format_doc_paragraph_by_match", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def format_doc_paragraph_by_match(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    match_text: str,
+    occurrence: int = 1,
+    match_case: bool = False,
+    heading_level: Optional[int] = None,
+    alignment: Optional[str] = None,
+    line_spacing: Optional[float] = None,
+    indent_first_line: Optional[float] = None,
+    indent_start: Optional[float] = None,
+    indent_end: Optional[float] = None,
+    space_above: Optional[float] = None,
+    space_below: Optional[float] = None,
+    named_style_type: Optional[str] = None,
+    direction: Optional[str] = None,
+    keep_lines_together: Optional[bool] = None,
+    keep_with_next: Optional[bool] = None,
+    avoid_widow_and_orphan: Optional[bool] = None,
+    page_break_before: Optional[bool] = None,
+    spacing_mode: Optional[str] = None,
+    shading_color: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    required_revision_id: Optional[str] = None,
+) -> str:
+    """
+    Apply paragraph style to the paragraph containing a text match.
+
+    Use this for headings, spacing, alignment, and indentation without
+    computing paragraph indexes.
+
+    Args:
+        match_text: Text inside the target paragraph.
+        occurrence: Which matching paragraph to format, starting at 1.
+        match_case: Whether the match is case-sensitive.
+        required_revision_id: Optional revision guard. The write fails if the
+            document changed after this revision.
+        Remaining arguments: standard paragraph style fields.
+
+    Returns:
+        str: Confirmation with the paragraph index range.
+    """
+    if not match_text or not match_text.strip():
+        return "Error: match_text is required."
+    if occurrence < 1:
+        return "Error: occurrence must be 1 or greater."
+
+    doc = await asyncio.to_thread(
+        service.documents()
+        .get(documentId=document_id, includeTabsContent=True)
+        .execute
+    )
+    content = get_doc_body_content(doc, tab_id)
+    match_range = find_paragraph_range_in_content(
+        content, match_text, occurrence, match_case
+    )
+    if not match_range:
+        return (
+            f"Error: No paragraph containing '{match_text}' occurrence "
+            f"{occurrence} was found in document {document_id}."
+        )
+
+    start_index, end_index = match_range
+    request = create_update_paragraph_style_request(
+        start_index,
+        end_index,
+        heading_level=heading_level,
+        alignment=alignment,
+        line_spacing=line_spacing,
+        indent_first_line=indent_first_line,
+        indent_start=indent_start,
+        indent_end=indent_end,
+        space_above=space_above,
+        space_below=space_below,
+        named_style_type=named_style_type,
+        direction=direction,
+        keep_lines_together=keep_lines_together,
+        keep_with_next=keep_with_next,
+        avoid_widow_and_orphan=avoid_widow_and_orphan,
+        page_break_before=page_break_before,
+        spacing_mode=spacing_mode,
+        shading_color=shading_color,
+        tab_id=tab_id,
+    )
+    if not request:
+        return "Error: provide at least one paragraph style option."
+
+    revision_id = required_revision_id or doc.get("revisionId")
+    body: dict[str, Any] = {"requests": [request]}
+    if revision_id:
+        body["writeControl"] = {"requiredRevisionId": revision_id}
+
+    try:
+        await asyncio.to_thread(
+            service.documents()
+            .batchUpdate(documentId=document_id, body=body)
+            .execute
+        )
+    except Exception as exc:
+        revision_error = revision_failure_message(exc)
+        if revision_error:
+            return f"Error: {revision_error}"
+        raise
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    return (
+        f"Applied paragraph style to the paragraph containing '{match_text}' "
+        f"(occurrence {occurrence}) at indexes {start_index}-{end_index} in "
+        f"document {document_id}. Revision used: {revision_id or 'none'}. "
+        f"Link: {link}"
+    )
+
+
+@server.tool()
 @handle_http_errors("insert_doc_elements", service_type="docs")
 @require_google_service("docs", "docs_write")
 async def insert_doc_elements(
@@ -986,6 +1219,7 @@ async def batch_update_doc(
     user_google_email: str,
     document_id: str,
     operations: BatchDocOperations,
+    required_revision_id: Optional[str] = None,
 ) -> str:
     """
     Executes multiple low-level document operations in a single atomic batch update.
@@ -1050,6 +1284,9 @@ async def batch_update_doc(
         document_id: ID of the document to update
         operations: List of operation dicts. Each operation MUST have a 'type' field.
                     All operations accept an optional 'tab_id' to target a specific tab.
+        required_revision_id: Optional revision guard. The write is rejected when
+                    the document has moved past this revision. Use the revision ID
+                    returned by a read or a previous write.
 
     Supported operation types and their parameters:
 
@@ -1217,7 +1454,7 @@ async def batch_update_doc(
     batch_manager = BatchOperationManager(service)
 
     success, message, metadata = await batch_manager.execute_batch_operations(
-        document_id, normalized_operations
+        document_id, normalized_operations, required_revision_id=required_revision_id
     )
 
     if success:
@@ -1483,6 +1720,9 @@ async def inspect_doc_structure(
 
     if tab_id:
         result["inspected_tab_id"] = tab_id
+
+    if doc.get("revisionId"):
+        result["revision_id"] = doc["revisionId"]
 
     link = f"https://docs.google.com/document/d/{document_id}/edit"
     return f"Document structure analysis for {document_id}:\n\n{json.dumps(result, indent=2)}\n\nLink: {link}"
