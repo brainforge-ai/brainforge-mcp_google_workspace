@@ -590,6 +590,14 @@ def handle_http_errors(
                 except HttpError as error:
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
+                    raw_content = getattr(error, "content", None)
+                    if raw_content:
+                        try:
+                            error_details += " " + raw_content.decode(
+                                "utf-8", "replace"
+                            )
+                        except (AttributeError, UnicodeDecodeError):
+                            pass
 
                     # Quota / transient availability: respect Retry-After and back off.
                     if error.resp.status in (429, 503):
@@ -665,7 +673,21 @@ def handle_http_errors(
                                 "LLM: Try 'start_google_auth' with the user's email "
                                 "and the appropriate service_name."
                             )
-                        if service_type == "drive":
+                        drive_permission_403 = (
+                            service_type == "drive"
+                            and is_read_only
+                            and error.resp.status == 403
+                            and not any(
+                                reason in error_details
+                                for reason in (
+                                    "rateLimitExceeded",
+                                    "userRateLimitExceeded",
+                                    "dailyLimitExceeded",
+                                    "storageQuotaExceeded",
+                                )
+                            )
+                        )
+                        if drive_permission_403:
                             auth_hint += (
                                 " For Drive, also confirm the user is a member of the "
                                 "shared drive and that the file or folder is shared "
