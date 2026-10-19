@@ -665,6 +665,13 @@ def handle_http_errors(
                                 "LLM: Try 'start_google_auth' with the user's email "
                                 "and the appropriate service_name."
                             )
+                        if service_type == "drive":
+                            auth_hint += (
+                                " For Drive, also confirm the user is a member of the "
+                                "shared drive and that the file or folder is shared "
+                                "with them; reading content requires a read scope "
+                                "(for example drive.readonly)."
+                            )
                         message = (
                             f"API error in {tool_name}: {error}. "
                             f"You might need to re-authenticate for user '{user_google_email}'. "

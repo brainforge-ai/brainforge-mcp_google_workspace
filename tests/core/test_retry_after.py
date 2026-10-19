@@ -127,3 +127,18 @@ async def test_non_sheets_message_omits_sheets_limits():
     with pytest.raises(Exception) as exc:
         await fn()
     assert "Sheets limits" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_drive_403_adds_shared_drive_and_scope_hint():
+    """Drive 403s name shared-drive membership and the read scope, not just re-auth."""
+
+    @handle_http_errors("t", service_type="drive")
+    async def fn():
+        raise HttpError(_resp(403), b"forbidden")
+
+    with pytest.raises(Exception) as exc:
+        await fn()
+    message = str(exc.value).lower()
+    assert "shared drive" in message
+    assert "read scope" in message

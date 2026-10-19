@@ -214,12 +214,27 @@ async def search_drive_files(
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
     files = results.get("files", [])
+    incomplete_search = bool(results.get("incompleteSearch"))
     if not files:
+        if incomplete_search:
+            return (
+                f"Drive returned no files for '{query}', but incompleteSearch=true "
+                "means this may be a partial result. Retry with a specific "
+                "drive_id or corpora='user'."
+            )
         return f"No files found for '{query}'."
 
     next_token = results.get("nextPageToken")
     header = f"Found {len(files)} files for {user_google_email} matching '{query}':"
-    formatted_files_text_parts = [header]
+    formatted_files_text_parts = [
+        header,
+        "Results are metadata only; use get_drive_file_content to read file contents.",
+    ]
+    if incomplete_search:
+        formatted_files_text_parts.append(
+            "Warning: Drive reported incompleteSearch=true; results may omit files "
+            "you can access. Retry with a specific drive_id or corpora='user'."
+        )
     for item in files:
         if detailed:
             size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
@@ -605,14 +620,29 @@ async def list_drive_items(
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
     files = results.get("files", [])
+    incomplete_search = bool(results.get("incompleteSearch"))
     if not files:
+        if incomplete_search:
+            return (
+                f"Drive returned no items in folder '{folder_id}', but "
+                "incompleteSearch=true means this may be a partial result. Retry "
+                "with a specific drive_id or corpora='user'."
+            )
         return f"No items found in folder '{folder_id}'."
 
     next_token = results.get("nextPageToken")
     header = (
         f"Found {len(files)} items in folder '{folder_id}' for {user_google_email}:"
     )
-    formatted_items_text_parts = [header]
+    formatted_items_text_parts = [
+        header,
+        "Results are metadata only; use get_drive_file_content to read file contents.",
+    ]
+    if incomplete_search:
+        formatted_items_text_parts.append(
+            "Warning: Drive reported incompleteSearch=true; results may omit files "
+            "you can access. Retry with a specific drive_id or corpora='user'."
+        )
     for item in files:
         if detailed:
             size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""

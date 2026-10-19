@@ -1104,3 +1104,114 @@ def test_resolve_file_type_mime_empty_raises():
 
     with pytest.raises(ValueError, match="cannot be empty"):
         resolve_file_type_mime("   ")
+
+
+# ---------------------------------------------------------------------------
+# incompleteSearch and result markers (PLT-2330)
+# ---------------------------------------------------------------------------
+
+
+def test_build_drive_list_params_requests_incomplete_search():
+    """The response fields include incompleteSearch so callers can detect partial results."""
+    params = build_drive_list_params(query="trashed=false", page_size=10)
+
+    assert "incompleteSearch" in params["fields"]
+
+
+@pytest.mark.asyncio
+async def test_search_drive_files_warns_when_search_incomplete():
+    """A partial shared-drive search is reported, not returned as a clean result."""
+    mock_service = Mock()
+    mock_service.files().list().execute.return_value = {
+        "files": [
+            {
+                "id": "f1",
+                "name": "Report.pdf",
+                "mimeType": "application/pdf",
+                "webViewLink": "https://drive.google.com/file/f1",
+                "modifiedTime": "2024-01-01T00:00:00Z",
+            }
+        ],
+        "incompleteSearch": True,
+    }
+
+    result = await _unwrap(search_drive_files)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        query="budget",
+    )
+
+    assert "incomplete" in result.lower()
+    assert "drive_id" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_drive_files_marks_results_as_metadata_only():
+    """Search results say they are metadata so callers do not assume file content."""
+    mock_service = Mock()
+    mock_service.files().list().execute.return_value = {
+        "files": [
+            {
+                "id": "f2",
+                "name": "Notes.docx",
+                "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "webViewLink": "https://drive.google.com/file/f2",
+                "modifiedTime": "2024-02-01T00:00:00Z",
+            }
+        ]
+    }
+
+    result = await _unwrap(search_drive_files)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        query="notes",
+    )
+
+    assert "metadata only" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_drive_files_incomplete_with_no_results_is_not_a_clean_zero():
+    """An empty partial search is distinguished from a true zero."""
+    mock_service = Mock()
+    mock_service.files().list().execute.return_value = {
+        "files": [],
+        "incompleteSearch": True,
+    }
+
+    result = await _unwrap(search_drive_files)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        query="missing",
+    )
+
+    assert "incomplete" in result.lower()
+    assert "no files found" not in result.lower()
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+async def test_list_drive_items_warns_when_search_incomplete(mock_resolve_folder):
+    """Folder listings report incompleteSearch too."""
+    mock_resolve_folder.return_value = "root"
+    mock_service = Mock()
+    mock_service.files().list().execute.return_value = {
+        "files": [
+            {
+                "id": "folder1",
+                "name": "Archive",
+                "mimeType": "application/vnd.google-apps.folder",
+                "webViewLink": "https://drive.google.com/drive/folders/folder1",
+                "modifiedTime": "2024-01-15T00:00:00Z",
+            }
+        ],
+        "incompleteSearch": True,
+    }
+
+    result = await _unwrap(list_drive_items)(
+        service=mock_service,
+        user_google_email="user@example.com",
+    )
+
+    assert "incomplete" in result.lower()
+    assert "metadata only" in result.lower()
