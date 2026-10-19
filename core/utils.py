@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import zipfile
 import ssl
 import asyncio
@@ -19,6 +20,110 @@ from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+
+
+_SERVICE_LABELS = {
+    "gmail": "Gmail",
+    "drive": "Drive",
+    "docs": "Docs",
+    "sheets": "Sheets",
+    "slides": "Slides",
+    "calendar": "Calendar",
+}
+
+_RATE_LIMIT_REASONS = {
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "dailyLimitExceeded",
+    "storageQuotaExceeded",
+    "quotaExceeded",
+}
+
+
+def _extract_http_reason(details: str) -> Optional[str]:
+    """Pull the first Google reason or quota ID out of an error payload."""
+    for key in ("reason", "quotaId"):
+        match = re.search(rf'"{key}"\s*:\s*"([^"]+)"', details)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _service_recovery_hint(
+    service_type: Optional[str], status: int, reason: Optional[str]
+) -> str:
+    """Return one concrete next step for a Google API failure."""
+    if status in (429, 503):
+        return (
+            "Back off and retry. For expensive reads, use search or list first, "
+            "then fetch only the items you need."
+        )
+    if status == 401:
+        return "Re-authenticate the user and retry."
+    if status == 403 and reason in _RATE_LIMIT_REASONS:
+        return "This is a rate limit, not a permission problem. Back off and retry."
+    if status == 403:
+        if service_type == "drive":
+            return (
+                "Confirm shared drive membership, file ACLs, and a read scope "
+                "such as drive.readonly."
+            )
+        if service_type == "gmail":
+            return (
+                "Check the Gmail scope for this action. For sends, create a draft "
+                "first and only send with explicit confirmation."
+            )
+        if service_type in ("docs", "slides"):
+            return (
+                "Confirm the file is shared with the user and that the write scope "
+                "is granted. Re-read the file before retrying."
+            )
+        if service_type == "sheets":
+            return (
+                "Confirm the spreadsheet ID, tab name, and that the user can edit "
+                "the file."
+            )
+        return (
+            "Confirm the user has access and the required scope, then "
+            "re-authenticate if needed."
+        )
+    if status == 404:
+        return "Check the file or document ID and that it is shared with the user."
+    lowered_reason = (reason or "").lower()
+    if "revision" in lowered_reason or "precondition" in lowered_reason:
+        return (
+            "Re-read the document or presentation, then retry with the current "
+            "revision ID."
+        )
+    if status == 400:
+        return (
+            "Check the request fields and IDs. Re-read the object if the request "
+            "uses indexes or revisions."
+        )
+    return "Retry once. If it fails again, re-authenticate and check the request fields."
+
+
+def _format_api_error(
+    tool_name: str,
+    service_type: Optional[str],
+    status: int,
+    details: str,
+    reason: Optional[str] = None,
+    retry: Optional[str] = None,
+    next_step: Optional[str] = None,
+) -> str:
+    """Build the shared error envelope used by every Google service."""
+    lines = [f"API error in {tool_name}: HTTP {status}."]
+    if service_type:
+        lines.append(f"Service: {_SERVICE_LABELS.get(service_type, service_type)}")
+    if reason:
+        lines.append(f"Reason: {reason}")
+    if retry:
+        lines.append(f"Retry: {retry}")
+    if next_step:
+        lines.append(f"Next step: {next_step}")
+    lines.append(f"Details: {details}")
+    return "\n".join(lines)
 
 logger = logging.getLogger(__name__)
 
@@ -614,21 +719,28 @@ def handle_http_errors(
                             )
                             await asyncio.sleep(delay)
                             continue
-                        hint = (
-                            f" Retry after ~{retry_after}s."
+                        reason = _extract_http_reason(error_details)
+                        retry_note = (
+                            f"after ~{retry_after:g}s"
                             if retry_after is not None
-                            else ""
+                            else "with exponential backoff"
                         )
-                        limits = (
-                            " Sheets limits are 300 reads + 300 writes/min/project "
-                            "and 60 + 60/min/user."
-                            if service_type == "sheets"
-                            else ""
+                        next_step = _service_recovery_hint(
+                            service_type, error.resp.status, reason
                         )
-                        message = (
-                            f"API error in {tool_name}: quota or transient availability "
-                            f"(HTTP {error.resp.status}).{hint} Back off and retry.{limits} "
-                            f"{error}"
+                        if service_type == "sheets":
+                            next_step += (
+                                " Sheets limits are 300 reads + 300 writes/min/project "
+                                "and 60 + 60/min/user."
+                            )
+                        message = _format_api_error(
+                            tool_name,
+                            service_type,
+                            error.resp.status,
+                            str(error),
+                            reason=reason,
+                            retry=retry_note,
+                            next_step=next_step,
                         )
                         logger.error(
                             f"Quota error in {tool_name}: {error}", exc_info=True
@@ -673,35 +785,37 @@ def handle_http_errors(
                                 "LLM: Try 'start_google_auth' with the user's email "
                                 "and the appropriate service_name."
                             )
-                        drive_permission_403 = (
-                            service_type == "drive"
-                            and is_read_only
-                            and error.resp.status == 403
-                            and not any(
-                                reason in error_details
-                                for reason in (
-                                    "rateLimitExceeded",
-                                    "userRateLimitExceeded",
-                                    "dailyLimitExceeded",
-                                    "storageQuotaExceeded",
-                                )
-                            )
+                        reason = _extract_http_reason(error_details)
+                        service_hint = _service_recovery_hint(
+                            service_type, error.resp.status, reason
                         )
-                        if drive_permission_403:
-                            auth_hint += (
-                                " For Drive, also confirm the user is a member of the "
-                                "shared drive and that the file or folder is shared "
-                                "with them; reading content requires a read scope "
-                                "(for example drive.readonly)."
-                            )
-                        message = (
-                            f"API error in {tool_name}: {error}. "
-                            f"You might need to re-authenticate for user '{user_google_email}'. "
-                            f"{auth_hint}"
+                        next_step = (
+                            f"You might need to re-authenticate for user "
+                            f"'{user_google_email}'. {auth_hint} {service_hint}"
+                        )
+                        message = _format_api_error(
+                            tool_name,
+                            service_type,
+                            error.resp.status,
+                            str(error),
+                            reason=reason,
+                            next_step=next_step,
                         )
                     else:
-                        # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
-                        message = f"API error in {tool_name}: {error}"
+                        # Other HTTP errors (400 Bad Request, 404, etc.)
+                        reason = _extract_http_reason(error_details)
+                        if not reason and "revision" in error_details.lower():
+                            reason = "revision mismatch"
+                        message = _format_api_error(
+                            tool_name,
+                            service_type,
+                            error.resp.status,
+                            str(error),
+                            reason=reason,
+                            next_step=_service_recovery_hint(
+                                service_type, error.resp.status, reason
+                            ),
+                        )
 
                     logger.error(f"API error in {tool_name}: {error}", exc_info=True)
                     raise Exception(message) from error
