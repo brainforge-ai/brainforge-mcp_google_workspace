@@ -66,6 +66,8 @@ docs:
     - get_doc_as_markdown
     - list_document_comments
     - manage_document_comment
+    - format_doc_text_by_match
+    - format_doc_paragraph_by_match
   complete:
     - insert_doc_image
     - update_doc_headers_footers

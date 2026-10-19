@@ -66,7 +66,10 @@ class BatchOperationManager:
         self.validation_manager = ValidationManager()
 
     async def execute_batch_operations(
-        self, document_id: str, operations: list[dict[str, Any]]
+        self,
+        document_id: str,
+        operations: list[dict[str, Any]],
+        required_revision_id: str | None = None,
     ) -> tuple[bool, str, dict[str, Any]]:
         """
         Execute multiple document operations in a single atomic batch.
@@ -106,7 +109,9 @@ class BatchOperationManager:
                 return False, "No valid requests could be built from operations", {}
 
             # Execute the batch
-            result = await self._execute_batch_requests(document_id, requests)
+            result = await self._execute_batch_requests(
+                document_id, requests, required_revision_id
+            )
 
             # Process results
             metadata = {
@@ -146,7 +151,14 @@ class BatchOperationManager:
             return True, msg, metadata
 
         except Exception as e:
-            error_msg = self._rewrite_execution_error(str(e), operations)
+            error_text = str(e)
+            raw_content = getattr(e, "content", None)
+            if raw_content:
+                try:
+                    error_text += " " + raw_content.decode("utf-8", "replace")
+                except (AttributeError, UnicodeDecodeError):
+                    pass
+            error_msg = self._rewrite_execution_error(error_text, operations)
             logger.error(f"Failed to execute batch operations: {error_msg}")
             return False, error_msg, {}
 
@@ -850,7 +862,10 @@ class BatchOperationManager:
         return request, description
 
     async def _execute_batch_requests(
-        self, document_id: str, requests: list[dict[str, Any]]
+        self,
+        document_id: str,
+        requests: list[dict[str, Any]],
+        required_revision_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Execute the batch requests against the Google Docs API.
@@ -858,13 +873,19 @@ class BatchOperationManager:
         Args:
             document_id: Document ID
             requests: List of API requests
+            required_revision_id: Optional revision guard. The API rejects the
+                write when the document has moved past this revision.
 
         Returns:
             API response
         """
+        body: dict[str, Any] = {"requests": requests}
+        if required_revision_id:
+            body["writeControl"] = {"requiredRevisionId": required_revision_id}
+
         return await asyncio.to_thread(
             self.service.documents()
-            .batchUpdate(documentId=document_id, body={"requests": requests})
+            .batchUpdate(documentId=document_id, body=body)
             .execute
         )
 
@@ -931,6 +952,26 @@ class BatchOperationManager:
                 "For normal header or footer text, use update_doc_headers_footers "
                 "instead of batch_update_doc with create_header_footer. "
                 "Reserve create_header_footer for advanced section-break layouts."
+            )
+
+        if (
+            "revision" in lowered or "precondition" in lowered
+        ) and any(
+            marker in lowered
+            for marker in (
+                "required revision",
+                "requiredrevisionid",
+                "changed since",
+                "precondition",
+                "failed_precondition",
+                "mismatch",
+                "does not match",
+            )
+        ):
+            return (
+                "Batch operation failed: the document changed since the revision "
+                "you supplied. Re-read the document, then retry with the new "
+                f"required_revision_id. Original error: {error_msg}"
             )
 
         return f"Batch operation failed: {error_msg}"

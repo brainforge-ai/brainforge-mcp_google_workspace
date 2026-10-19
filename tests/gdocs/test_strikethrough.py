@@ -33,7 +33,12 @@ def _schema_subset():
     components = get_tool_components(server)
     return {
         name: components[name].parameters
-        for name in ("modify_doc_text", "batch_update_doc")
+        for name in (
+            "modify_doc_text",
+            "batch_update_doc",
+            "format_doc_text_by_match",
+            "format_doc_paragraph_by_match",
+        )
     }
 
 
