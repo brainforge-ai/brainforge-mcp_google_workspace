@@ -214,12 +214,41 @@ async def search_drive_files(
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
     files = results.get("files", [])
+    incomplete_search = bool(results.get("incompleteSearch"))
+    scope = (
+        f"drive_id={drive_id}"
+        if drive_id
+        else (f"corpora={corpora}" if corpora else "the default scope")
+    )
     if not files:
+        if incomplete_search:
+            if page_token:
+                return (
+                    f"No further results on this page for '{query}' under {scope}. "
+                    "incompleteSearch=true means the overall search may be partial."
+                )
+            return (
+                f"Drive returned no files for '{query}' under {scope}, but "
+                "incompleteSearch=true means this may be a partial result. Retry "
+                "once with a specific drive_id; if it is still incomplete, report "
+                "the partial result and the scope searched."
+            )
         return f"No files found for '{query}'."
 
     next_token = results.get("nextPageToken")
     header = f"Found {len(files)} files for {user_google_email} matching '{query}':"
-    formatted_files_text_parts = [header]
+    formatted_files_text_parts = [
+        header,
+        "Entries are metadata only; use get_drive_file_content for a file's "
+        "contents. Folders have no file contents.",
+    ]
+    if incomplete_search:
+        formatted_files_text_parts.append(
+            f"Warning: Drive reported incompleteSearch=true for {scope}; results "
+            "may omit files you can access. Retry once with the same scope or a "
+            "specific drive_id; if it is still incomplete, report the partial "
+            "result and the scope searched."
+        )
     for item in files:
         if detailed:
             size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
@@ -279,9 +308,11 @@ async def get_drive_file_content(
     }.get(mime_type)
 
     request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+        service.files().export_media(
+            fileId=file_id, mimeType=export_mime_type, supportsAllDrives=True
+        )
         if export_mime_type
-        else service.files().get_media(fileId=file_id)
+        else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request_obj)
@@ -451,9 +482,11 @@ async def get_drive_file_download_url(
 
     # Download the file
     request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+        service.files().export_media(
+            fileId=file_id, mimeType=export_mime_type, supportsAllDrives=True
+        )
         if export_mime_type
-        else service.files().get_media(fileId=file_id)
+        else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
 
     fh = io.BytesIO()
@@ -605,14 +638,32 @@ async def list_drive_items(
 
     results = await asyncio.to_thread(service.files().list(**list_params).execute)
     files = results.get("files", [])
+    incomplete_search = bool(results.get("incompleteSearch"))
     if not files:
+        if incomplete_search:
+            return (
+                f"Drive returned no items in folder '{folder_id}', but "
+                "incompleteSearch=true means this may be a partial result. Retry "
+                "once with the shared drive's drive_id; if it is still incomplete, "
+                "report the partial result."
+            )
         return f"No items found in folder '{folder_id}'."
 
     next_token = results.get("nextPageToken")
     header = (
         f"Found {len(files)} items in folder '{folder_id}' for {user_google_email}:"
     )
-    formatted_items_text_parts = [header]
+    formatted_items_text_parts = [
+        header,
+        "Entries are metadata only; use get_drive_file_content for a file's "
+        "contents. Folders have no file contents.",
+    ]
+    if incomplete_search:
+        formatted_items_text_parts.append(
+            "Warning: Drive reported incompleteSearch=true for this folder; "
+            "results may omit items you can access. Retry once with the shared "
+            "drive's drive_id; if it is still incomplete, report the partial result."
+        )
     for item in files:
         if detailed:
             size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
@@ -1320,7 +1371,7 @@ async def check_drive_file_public_access(
     list_params = {
         "q": query,
         "pageSize": 10,
-        "fields": "files(id, name, mimeType, webViewLink)",
+        "fields": "incompleteSearch, files(id, name, mimeType, webViewLink)",
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
     }
@@ -1329,6 +1380,12 @@ async def check_drive_file_public_access(
 
     files = results.get("files", [])
     if not files:
+        if results.get("incompleteSearch"):
+            return (
+                f"Drive returned no file named '{file_name}', but "
+                "incompleteSearch=true means this may be a partial result. Retry "
+                "with a specific drive_id."
+            )
         return f"No file found with name '{file_name}'"
 
     if len(files) > 1:

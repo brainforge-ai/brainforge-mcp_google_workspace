@@ -127,3 +127,44 @@ async def test_non_sheets_message_omits_sheets_limits():
     with pytest.raises(Exception) as exc:
         await fn()
     assert "Sheets limits" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_drive_403_adds_shared_drive_and_scope_hint():
+    """Drive permission 403s name shared-drive membership and the read scope."""
+
+    @handle_http_errors("t", is_read_only=True, service_type="drive")
+    async def fn():
+        raise HttpError(_resp(403), b"forbidden")
+
+    with pytest.raises(Exception) as exc:
+        await fn()
+    message = str(exc.value).lower()
+    assert "shared drive" in message
+    assert "read scope" in message
+
+
+@pytest.mark.asyncio
+async def test_drive_401_omits_shared_drive_hint():
+    """A 401 is a token problem, not a shared-drive permission problem."""
+
+    @handle_http_errors("t", is_read_only=True, service_type="drive")
+    async def fn():
+        raise HttpError(_resp(401), b"unauthorized")
+
+    with pytest.raises(Exception) as exc:
+        await fn()
+    assert "shared drive" not in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_drive_rate_limit_403_omits_shared_drive_hint():
+    """A rate-limit 403 must not be described as a permission problem."""
+
+    @handle_http_errors("t", is_read_only=True, service_type="drive")
+    async def fn():
+        raise HttpError(_resp(403), b'{"reason": "userRateLimitExceeded"}')
+
+    with pytest.raises(Exception) as exc:
+        await fn()
+    assert "shared drive" not in str(exc.value).lower()

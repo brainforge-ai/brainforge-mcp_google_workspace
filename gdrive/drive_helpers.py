@@ -207,9 +207,9 @@ def build_drive_list_params(
         Dictionary of parameters for Drive API list calls
     """
     if detailed:
-        fields = "nextPageToken, files(id, name, mimeType, webViewLink, iconLink, modifiedTime, size)"
+        fields = "nextPageToken, incompleteSearch, files(id, name, mimeType, webViewLink, iconLink, modifiedTime, size)"
     else:
-        fields = "nextPageToken, files(id, name, mimeType)"
+        fields = "nextPageToken, incompleteSearch, files(id, name, mimeType)"
     list_params = {
         "q": query,
         "pageSize": page_size,
