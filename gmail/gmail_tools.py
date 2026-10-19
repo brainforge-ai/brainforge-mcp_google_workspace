@@ -11,6 +11,8 @@ import binascii
 import re
 import ssl
 import mimetypes
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any
@@ -54,6 +56,52 @@ GMAIL_BATCH_SIZE = 25
 GMAIL_REQUEST_DELAY = 0.1
 HTML_BODY_TRUNCATE_LIMIT = 20000
 RAW_BODY_TRUNCATE_LIMIT = 20000
+
+_GMAIL_DATE_FILTER_RE = re.compile(
+    r"\b(after|before):(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b"
+)
+
+
+def _pacific_timezone():
+    try:
+        return ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=-8))
+
+
+def _normalize_gmail_date_filters(query: str) -> tuple[str, bool]:
+    """Convert YYYY/MM/DD filters to epoch seconds at Pacific midnight.
+
+    Gmail interprets date-only filters as midnight Pacific Time. Sending epoch
+    seconds makes the window explicit and independent of the caller's timezone.
+    Dates inside quoted literals are left alone, and invalid dates pass through
+    for Gmail to validate.
+    """
+    changed = False
+    pacific = _pacific_timezone()
+
+    def replace(match: re.Match) -> str:
+        nonlocal changed
+        operator, year, month, day = match.groups()
+        try:
+            midnight_pacific = datetime(
+                int(year),
+                int(month),
+                int(day),
+                tzinfo=pacific,
+            )
+        except ValueError:
+            return match.group(0)
+        changed = True
+        return f"{operator}:{int(midnight_pacific.timestamp())}"
+
+    # Only rewrite outside double-quoted literals.
+    parts = query.split('"')
+    for index in range(0, len(parts), 2):
+        parts[index] = _GMAIL_DATE_FILTER_RE.sub(replace, parts[index])
+
+    return '"'.join(parts), changed
+
 
 GMAIL_METADATA_HEADERS = [
     "Subject",
@@ -1147,11 +1195,17 @@ def _generate_gmail_web_url(item_id: str, account_index: int = 0) -> str:
 
 
 def _format_gmail_results_plain(
-    messages: list, query: str, next_page_token: Optional[str] = None
+    messages: list,
+    query: str,
+    next_page_token: Optional[str] = None,
+    trailing_note: Optional[str] = None,
 ) -> str:
     """Format Gmail search results in clean, LLM-friendly plain text."""
     if not messages:
-        return f"No messages found for query: '{query}'"
+        message = f"No messages found for query: '{query}'"
+        if trailing_note:
+            message += f"\n\n{trailing_note}"
+        return message
 
     lines = [
         f"Found {len(messages)} messages matching '{query}':",
@@ -1210,6 +1264,11 @@ def _format_gmail_results_plain(
         ]
     )
 
+    # Add a normalization note before pagination so the token stays terminal.
+    if trailing_note:
+        lines.append("")
+        lines.append(trailing_note)
+
     # Add pagination info if there's a next page
     if next_page_token:
         lines.append("")
@@ -1250,7 +1309,14 @@ async def search_gmail_messages(
     )
 
     # Build the API request parameters
-    request_params = {"userId": "me", "q": query, "maxResults": page_size}
+    normalized_query, date_filters_normalized = _normalize_gmail_date_filters(
+        query
+    )
+    request_params = {
+        "userId": "me",
+        "q": normalized_query,
+        "maxResults": page_size,
+    }
 
     # Add page token if provided
     if page_token:
@@ -1274,7 +1340,17 @@ async def search_gmail_messages(
     # Extract next page token for pagination
     next_page_token = response.get("nextPageToken")
 
-    formatted_output = _format_gmail_results_plain(messages, query, next_page_token)
+    formatted_output = _format_gmail_results_plain(
+        messages,
+        query,
+        next_page_token,
+        trailing_note=(
+            "Note: date filters were converted to Pacific midnight epoch "
+            "seconds so the window is timezone-independent."
+            if date_filters_normalized
+            else None
+        ),
+    )
 
     logger.info(f"[search_gmail_messages] Found {len(messages)} messages")
     if next_page_token:
@@ -1801,6 +1877,12 @@ async def send_gmail_message(
             description='Optional list of attachments. Each can have: "url" (fetch from URL — works with MCP attachment URLs from get_drive_file_download_url / get_gmail_attachment_content), OR "path" (file path, auto-encodes), OR "content" (standard base64, not urlsafe) + "filename". Optional "mime_type". Example: [{"url": "https://host/attachments/abc-123", "filename": "report.pdf"}]',
         ),
     ] = None,
+    confirm_send: Annotated[
+        bool,
+        Field(
+            description="Set true to actually send. Defaults to false, which refuses the send and recommends creating a draft. Only set this when the user explicitly asked to send.",
+        ),
+    ] = False,
 ) -> str:
     """
     Sends an email using the user's Gmail account. Supports both new emails and replies with optional attachments.
@@ -1830,13 +1912,17 @@ async def send_gmail_message(
         thread_id (Optional[str]): Optional Gmail thread ID to reply within. When provided, sends a reply.
         in_reply_to (Optional[str]): Optional RFC Message-ID of the message being replied to (e.g., '<message123@gmail.com>').
         references (Optional[str]): Optional chain of RFC Message-IDs for proper threading (e.g., '<msg1@gmail.com> <msg2@gmail.com>').
+        confirm_send (bool): Set true to send. Defaults to false, which refuses
+            the send and recommends a draft.
 
     Returns:
         str: Confirmation message with the sent email's message ID.
 
     Examples:
+        # Sending requires confirm_send=True. Draft first when the user has
+        # not explicitly asked to send.
         # Send a new email
-        send_gmail_message(to="user@example.com", subject="Hello", body="Hi there!")
+        send_gmail_message(to="user@example.com", subject="Hello", body="Hi there!", confirm_send=True)
 
         # Send with a custom display name
         send_gmail_message(to="user@example.com", subject="Hello", body="Hi there!", from_name="John Doe")
@@ -1902,6 +1988,13 @@ async def send_gmail_message(
         f"[send_gmail_message] Invoked. Email: '{user_google_email}', Subject: '{subject}', Attachments: {len(attachments) if attachments else 0}"
     )
 
+    if not confirm_send:
+        raise UserInputError(
+            "Sending is disabled by default. Create a draft with "
+            "draft_gmail_message, or set confirm_send=true only when the user "
+            "has explicitly asked to send now."
+        )
+
     # Prepare the email message
     # Use from_email (Send As alias) if provided, otherwise default to authenticated user
     sender_email = from_email or user_google_email
@@ -1949,8 +2042,14 @@ async def send_gmail_message(
         attachment_info = _format_attachment_result(
             attached_count, requested_attachment_count
         )
-        return f"Email sent{attachment_info}! Message ID: {message_id}"
-    return f"Email sent! Message ID: {message_id}"
+        return (
+            f"Email sent{attachment_info}! Message ID: {message_id}\n"
+            "Consumed ~100 quota units."
+        )
+    return (
+        f"Email sent! Message ID: {message_id}\n"
+        "Consumed ~100 quota units."
+    )
 
 
 @server.tool()
@@ -2213,6 +2312,131 @@ async def draft_gmail_message(
         attached_count, requested_attachment_count
     )
     return f"Draft created{attachment_info}! Draft ID: {draft_id}"
+
+
+def _message_has_attachments(message: dict) -> bool:
+    """Return True when a message payload contains an attachment part."""
+
+    def walk(part: dict) -> bool:
+        if part.get("filename") or part.get("body", {}).get("attachmentId"):
+            return True
+        return any(walk(child) for child in part.get("parts", []))
+
+    return walk(message.get("payload", {}))
+
+
+@server.tool()
+@handle_http_errors("update_draft", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def update_draft(
+    service,
+    user_google_email: str,
+    draft_id: str,
+    subject: str,
+    body: str,
+    body_format: Literal["plain", "html"] = "plain",
+    to: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    from_name: Optional[str] = None,
+    from_email: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    include_signature: bool = False,
+    allow_drop_attachments: bool = False,
+) -> str:
+    """
+    Replace the contents of an existing Gmail draft.
+
+    Gmail drafts are replaced, not edited in place: the updated draft keeps its
+    draft ID but the underlying message ID changes. Omitted recipients, thread,
+    and reply headers are inherited from the existing draft. Drafts with
+    attachments are refused unless allow_drop_attachments is true.
+
+    Args:
+        draft_id: Draft to update, from draft_gmail_message.
+        subject: Email subject.
+        body: Email body.
+        body_format: "plain" or "html".
+        Omitted to/cc/bcc/thread/reply headers are inherited from the draft.
+        include_signature: Append the Gmail signature. Defaults to false to
+            avoid duplicating a signature already present in the draft.
+        allow_drop_attachments: Replace a draft that has attachments, dropping
+            those attachments. Defaults to false.
+    """
+    logger.info(
+        f"[update_draft] Invoked. Email: '{user_google_email}', Draft: '{draft_id}'"
+    )
+
+    existing = await asyncio.to_thread(
+        service.users()
+        .drafts()
+        .get(userId="me", id=draft_id, format="full")
+        .execute
+    )
+    existing_message = existing.get("message", {})
+    headers = {
+        header.get("name", "").lower(): header.get("value", "")
+        for header in existing_message.get("payload", {}).get("headers", [])
+    }
+
+    if _message_has_attachments(existing_message) and not allow_drop_attachments:
+        return (
+            f"Error: Draft '{draft_id}' has attachments. Pass "
+            "allow_drop_attachments=true to replace it without them."
+        )
+
+    to = to or headers.get("to")
+    cc = cc or headers.get("cc")
+    bcc = bcc or headers.get("bcc")
+    thread_id = thread_id or existing_message.get("threadId")
+    in_reply_to = in_reply_to or headers.get("in-reply-to")
+    references = references or headers.get("references")
+
+    sender_email = from_email or user_google_email
+    signature_html = ""
+    if include_signature:
+        signature_html = await _get_send_as_signature_html(
+            service, from_email=sender_email
+        )
+
+    draft_text = _append_signature_to_body(body, body_format, signature_html)
+    raw_message, thread_id_final, _, _ = _prepare_gmail_message(
+        subject=subject,
+        body=draft_text,
+        body_format=body_format,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        thread_id=thread_id,
+        in_reply_to=in_reply_to,
+        references=references,
+        from_email=sender_email,
+        from_name=from_name,
+        attachments=[],
+    )
+
+    draft_body: Dict[str, Any] = {"message": {"raw": raw_message}}
+    if thread_id_final:
+        draft_body["message"]["threadId"] = thread_id_final
+
+    updated_draft = await asyncio.to_thread(
+        service.users()
+        .drafts()
+        .update(userId="me", id=draft_id, body=draft_body)
+        .execute
+    )
+    message_id = updated_draft.get("message", {}).get("id")
+    if not message_id:
+        return (
+            f"Draft {draft_id} updated, but Gmail did not return a new "
+            "message ID.\nConsumed ~10 quota units."
+        )
+    return (
+        f"Draft {draft_id} updated. New message ID: {message_id}\n"
+        "Consumed ~10 quota units."
+    )
 
 
 def _format_thread_content(

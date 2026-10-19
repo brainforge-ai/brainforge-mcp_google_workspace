@@ -4,7 +4,7 @@ MCP tools for Gmail message search, sending, drafting, labels, and filters. All 
 
 ## Contents
 - Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content
-- Send & Draft: send_gmail_message, draft_gmail_message
+- Send & Draft: send_gmail_message (requires confirm_send=true), draft_gmail_message, update_draft
 - Label Management: list_gmail_labels, manage_gmail_label, modify_gmail_message_labels, batch_modify_gmail_message_labels
 - Filter Management: list_gmail_filters, manage_gmail_filter
 - Tips
@@ -72,6 +72,8 @@ Download an attachment to local disk (stdio mode) or get a temporary URL (HTTP m
 ### send_gmail_message
 Send an email. Supports new messages, replies, HTML, attachments, CC/BCC, and Send As aliases.
 
+Sending is gated: pass `confirm_send=true` only when the user explicitly asked to send now. Otherwise create a draft.
+
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | to | string | yes | | Recipient address |
@@ -87,6 +89,7 @@ Send an email. Supports new messages, replies, HTML, attachments, CC/BCC, and Se
 | in_reply_to | string | no | | RFC Message-ID being replied to, e.g. `<msg@gmail.com>` |
 | references | string | no | | Space-separated chain of Message-IDs for threading |
 | attachments | array | no | | See attachment format below |
+| confirm_send | bool | no | false | Must be true to send. Defaults to false and refuses the send. |
 
 **Attachment format** (each item is an object):
 - **File path**: `{"path": "path/to/file.pdf"}` -- optionally add `"filename"` and `"mime_type"`. Use forward slashes on all platforms
@@ -216,7 +219,7 @@ Create or delete a filter.
 
 ### Drafts vs Send
 - Use `draft_gmail_message` when you want the user to review before sending. It supports `include_signature` (auto-appends Gmail signature) and `quote_original` (includes quoted reply text).
-- Use `send_gmail_message` for immediate delivery.
+- Use `send_gmail_message` with `confirm_send=true` for immediate delivery.
 
 ### Attachments
 - To find attachments, read the message with `get_gmail_message_content` -- attachment IDs are listed in the response.
