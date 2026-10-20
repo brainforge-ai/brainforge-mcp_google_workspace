@@ -969,9 +969,13 @@ class BatchOperationManager:
             )
         ):
             return (
-                "Batch operation failed: the document changed since the revision "
-                "you supplied. Re-read the document, then retry with the new "
-                f"required_revision_id. Original error: {error_msg}"
+                "API error in batch_update_doc: HTTP 400.\n"
+                "Service: Docs\n"
+                "Reason: revision mismatch\n"
+                "Next step: The document changed since the revision you supplied. "
+                "Re-read the document, then retry with the new "
+                "required_revision_id.\n"
+                f"Details: {error_msg}"
             )
 
         return f"Batch operation failed: {error_msg}"
