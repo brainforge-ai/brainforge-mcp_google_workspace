@@ -34,11 +34,12 @@ Create, update, or delete a calendar event.
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
-| action | string | yes | | `create`, `update`, or `delete` |
+| action | string | yes | | `create`, `update`, `delete`, or `rsvp` |
 | summary | string | for create | | Event title |
-| start_time | string | for create | | RFC 3339 format |
-| end_time | string | for create | | RFC 3339 format |
-| event_id | string | for update/delete | | Event ID |
+| start_time | string | for create | | RFC 3339 format. Timed writes need a timezone or explicit offset |
+| end_time | string | for create | | RFC 3339 format. Timed writes need a timezone or explicit offset |
+| event_id | string | for update/delete/rsvp | | Event ID. For create, optional caller-supplied ID for idempotent retries |
+| edit_scope | string | for recurring update | | `instance` for one occurrence, `series` for all. Required when the ID is an instance |
 | calendar_id | string | no | primary | |
 | description | string | no | | Event description |
 | location | string | no | | Event location |
@@ -54,6 +55,7 @@ Create, update, or delete a calendar event.
 | guests_can_modify | boolean | no | | Attendees can edit the event |
 | guests_can_invite_others | boolean | no | | Attendees can invite others |
 | guests_can_see_other_guests | boolean | no | | Attendees can see other attendees |
+| send_updates | string | no | all | `all`, `externalOnly`, or `none` |
 
 **Reminder format** (each item is a dict):
 - `{"method": "email", "minutes": 30}` -- email reminder 30 minutes before

@@ -31,7 +31,7 @@ def _create_mock_service():
     mock_service = Mock()
     mock_service.events().insert().execute = Mock(return_value={})
     mock_service.events().get().execute = Mock(return_value={})
-    mock_service.events().update().execute = Mock(return_value={})
+    mock_service.events().patch().execute = Mock(return_value={})
     return mock_service
 
 
@@ -73,7 +73,7 @@ async def test_modify_event_preserves_existing_recurrence_when_not_overridden():
             "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"],
         }
     )
-    mock_service.events().update().execute = Mock(
+    mock_service.events().patch().execute = Mock(
         return_value={"id": "evt123", "htmlLink": "link", "summary": "Team Standup"}
     )
 
@@ -84,8 +84,8 @@ async def test_modify_event_preserves_existing_recurrence_when_not_overridden():
         summary="Team Standup",
     )
 
-    update_body = mock_service.events().update.call_args[1]["body"]
-    assert update_body["recurrence"] == ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"]
+    patch_body = mock_service.events().patch.call_args[1]["body"]
+    assert patch_body["recurrence"] == ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"]
 
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ async def test_modify_event_can_update_recurrence():
             "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"],
         }
     )
-    mock_service.events().update().execute = Mock(
+    mock_service.events().patch().execute = Mock(
         return_value={"id": "evt123", "htmlLink": "link", "summary": "Standup"}
     )
 
@@ -111,8 +111,8 @@ async def test_modify_event_can_update_recurrence():
         recurrence=["RRULE:FREQ=WEEKLY;COUNT=6"],
     )
 
-    update_body = mock_service.events().update.call_args[1]["body"]
-    assert update_body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=6"]
+    patch_body = mock_service.events().patch.call_args[1]["body"]
+    assert patch_body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=6"]
 
 
 @pytest.mark.asyncio
