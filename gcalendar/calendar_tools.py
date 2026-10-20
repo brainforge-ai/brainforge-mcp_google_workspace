@@ -368,6 +368,45 @@ def _correct_time_format_for_api(
     return time_str
 
 
+_EVENT_ID_RE = re.compile(r"^[a-v0-9]{5,1024}$")
+_UTC_OFFSET_RE = re.compile(r"[+-]\d{2}:\d{2}\Z")
+
+
+class _InsertConflict(Exception):
+    """Raised when a caller-supplied event ID already exists."""
+
+
+def _has_explicit_offset(datetime_str: str) -> bool:
+    return datetime_str.endswith("Z") or bool(_UTC_OFFSET_RE.search(datetime_str))
+
+
+def _validate_timed_write_timezone(
+    start_time: Optional[str],
+    end_time: Optional[str],
+    timezone: Optional[str],
+    action: str,
+) -> None:
+    """Require a timezone or explicit offset for timed writes.
+
+    All-day events use date-only values and do not need a timezone.
+    """
+    if timezone:
+        try:
+            pytz.timezone(timezone)
+        except pytz.exceptions.UnknownTimeZoneError as exc:
+            raise ValueError(
+                f"Unknown IANA timezone '{timezone}'. Use a name such as "
+                "America/New_York."
+            ) from exc
+
+    for field_name, value in (("start_time", start_time), ("end_time", end_time)):
+        if value and "T" in value and not timezone and not _has_explicit_offset(value):
+            raise ValueError(
+                f"{field_name} for a timed {action} needs an IANA timezone "
+                "(for example America/New_York) or an explicit UTC offset."
+            )
+
+
 def _strip_utc_offset(datetime_str: str) -> str:
     """Strip UTC offset from an RFC3339 dateTime string, returning a naive local time.
 
@@ -654,6 +693,7 @@ async def _create_event_impl(
     summary: str,
     start_time: str,
     end_time: str,
+    event_id: Optional[str] = None,
     calendar_id: str = "primary",
     description: Optional[str] = None,
     location: Optional[str] = None,
@@ -701,6 +741,13 @@ async def _create_event_impl(
             {"date": end_time} if "T" not in end_time else {"dateTime": effective_end}
         ),
     }
+    if event_id:
+        if not _EVENT_ID_RE.fullmatch(event_id):
+            raise ValueError(
+                "event_id must be 5-1024 characters from the base32hex "
+                "alphabet (a-v, 0-9)."
+            )
+        event_body["id"] = event_id
     if recurrence:
         event_body["recurrence"] = recurrence
     if location:
@@ -767,6 +814,66 @@ async def _create_event_impl(
         logger.info(
             f"[create_event] Adding Google Meet conference with request ID: {request_id}"
         )
+
+    async def _insert_event(supports_attachments: bool):
+        try:
+            return await asyncio.to_thread(
+                lambda: (
+                    service.events()
+                    .insert(
+                        calendarId=calendar_id,
+                        body=event_body,
+                        supportsAttachments=supports_attachments,
+                        conferenceDataVersion=1 if add_google_meet else 0,
+                        sendUpdates=send_updates,
+                    )
+                    .execute()
+                )
+            )
+        except HttpError as insert_error:
+            status = getattr(getattr(insert_error, "resp", None), "status", None)
+            details = str(insert_error)
+            raw_content = getattr(insert_error, "content", None)
+            if raw_content:
+                try:
+                    details += " " + raw_content.decode("utf-8", "replace")
+                except (AttributeError, UnicodeDecodeError):
+                    pass
+
+            if status == 409 and event_id and "duplicate" in details.lower():
+                try:
+                    existing_event = await asyncio.to_thread(
+                        lambda: (
+                            service.events()
+                            .get(calendarId=calendar_id, eventId=event_id)
+                            .execute()
+                        )
+                    )
+                except Exception as lookup_error:
+                    logger.warning(
+                        f"[create_event] Could not load existing event after 409: "
+                        f"{lookup_error}"
+                    )
+                    existing_event = {}
+
+                link = existing_event.get("htmlLink", "No link available")
+                requested_summary = event_body.get("summary")
+                existing_summary = existing_event.get("summary")
+                if (
+                    existing_summary
+                    and requested_summary
+                    and existing_summary != requested_summary
+                ):
+                    raise _InsertConflict(
+                        f"Event ID '{event_id}' already exists with different "
+                        f"details; it was not modified. Link: {link}\n"
+                        f"Notifications: {send_updates}."
+                    )
+                raise _InsertConflict(
+                    f"Event with ID '{event_id}' already exists; no duplicate "
+                    f"created. Link: {link}\nNotifications: {send_updates}."
+                )
+            raise
 
     if attachments:
         # Accept both file URLs and file IDs. If a URL, extract the fileId.
@@ -838,34 +945,21 @@ async def _create_event_impl(
         finally:
             if drive_service:
                 drive_service.close()
-        created_event = await asyncio.to_thread(
-            lambda: (
-                service.events()
-                .insert(
-                    calendarId=calendar_id,
-                    body=event_body,
-                    supportsAttachments=True,
-                    conferenceDataVersion=1 if add_google_meet else 0,
-                    sendUpdates=send_updates,
-                )
-                .execute()
-            )
-        )
+        try:
+            created_event = await _insert_event(True)
+        except _InsertConflict as conflict:
+            return str(conflict)
     else:
-        created_event = await asyncio.to_thread(
-            lambda: (
-                service.events()
-                .insert(
-                    calendarId=calendar_id,
-                    body=event_body,
-                    conferenceDataVersion=1 if add_google_meet else 0,
-                    sendUpdates=send_updates,
-                )
-                .execute()
-            )
-        )
+        try:
+            created_event = await _insert_event(False)
+        except _InsertConflict as conflict:
+            return str(conflict)
+
     link = created_event.get("htmlLink", "No link available")
-    confirmation_message = f"Successfully created event '{created_event.get('summary', summary)}' for {user_google_email}. Link: {link}"
+    confirmation_message = (
+        f"Successfully created event '{created_event.get('summary', summary)}' "
+        f"for {user_google_email}. Link: {link}\nNotifications: {send_updates}."
+    )
 
     # Add Google Meet information if conference was created
     if add_google_meet and "conferenceData" in created_event:
@@ -917,6 +1011,7 @@ async def _modify_event_impl(
     service,
     user_google_email: str,
     event_id: str,
+    edit_scope: Optional[str] = None,
     calendar_id: str = "primary",
     summary: Optional[str] = None,
     start_time: Optional[str] = None,
@@ -941,6 +1036,33 @@ async def _modify_event_impl(
     logger.info(
         f"[modify_event] Invoked. Email: '{user_google_email}', Event ID: {event_id}"
     )
+
+    if edit_scope is not None and edit_scope not in ("series", "instance"):
+        raise ValueError("edit_scope must be 'series' or 'instance'")
+
+    target_event = await asyncio.to_thread(
+        lambda: (
+            service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+        )
+    )
+
+    recurring_parent = target_event.get("recurringEventId")
+    if recurring_parent:
+        if edit_scope is None:
+            raise ValueError(
+                f"Event '{event_id}' is a recurring instance. Set "
+                "edit_scope='instance' to change this occurrence or "
+                f"edit_scope='series' to change every occurrence (parent "
+                f"'{recurring_parent}')."
+            )
+        target_event_id = recurring_parent if edit_scope == "series" else event_id
+    else:
+        if edit_scope == "instance":
+            raise ValueError(
+                f"Event '{event_id}' is not a recurring instance. Use "
+                "edit_scope='series' for a standalone event."
+            )
+        target_event_id = event_id
 
     # Build the event body with only the fields that are provided
     event_body: Dict[str, Any] = {}
@@ -989,10 +1111,12 @@ async def _modify_event_impl(
         else:
             # Preserve existing event's useDefault value if not explicitly specified
             try:
-                existing_event = (
-                    service.events()
-                    .get(calendarId=calendar_id, eventId=event_id)
-                    .execute()
+                existing_event = await asyncio.to_thread(
+                    lambda: (
+                        service.events()
+                        .get(calendarId=calendar_id, eventId=target_event_id)
+                        .execute()
+                    )
                 )
                 reminder_data["useDefault"] = existing_event.get("reminders", {}).get(
                     "useDefault", True
@@ -1063,14 +1187,17 @@ async def _modify_event_impl(
 
     # Log the event ID for debugging
     logger.info(
-        f"[modify_event] Attempting to update event with ID: '{event_id}' in calendar '{calendar_id}'"
+        f"[modify_event] Attempting to update event with ID: '{target_event_id}' "
+        f"(requested '{event_id}', scope '{edit_scope}') in calendar '{calendar_id}'"
     )
 
     # Get the existing event to preserve fields that aren't being updated
     try:
         existing_event = await asyncio.to_thread(
             lambda: (
-                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+                service.events()
+                .get(calendarId=calendar_id, eventId=target_event_id)
+                .execute()
             )
         )
         logger.info(
@@ -1131,9 +1258,9 @@ async def _modify_event_impl(
     updated_event = await asyncio.to_thread(
         lambda: (
             service.events()
-            .update(
+            .patch(
                 calendarId=calendar_id,
-                eventId=event_id,
+                eventId=target_event_id,
                 body=event_body,
                 conferenceDataVersion=1,
                 sendUpdates=send_updates,
@@ -1143,7 +1270,11 @@ async def _modify_event_impl(
     )
 
     link = updated_event.get("htmlLink", "No link available")
-    confirmation_message = f"Successfully modified event '{updated_event.get('summary', summary)}' (ID: {event_id}) for {user_google_email}. Link: {link}"
+    confirmation_message = (
+        f"Successfully modified event '{updated_event.get('summary', summary)}' "
+        f"(ID: {target_event_id}) for {user_google_email}. Scope: {edit_scope}. "
+        f"Link: {link}\nNotifications: {send_updates}."
+    )
 
     # Add Google Meet information if conference was added
     if add_google_meet is True and "conferenceData" in updated_event:
@@ -1214,7 +1345,10 @@ async def _delete_event_impl(
         )
     )
 
-    confirmation_message = f"Successfully deleted event (ID: {event_id}) from calendar '{calendar_id}' for {user_google_email}."
+    confirmation_message = (
+        f"Successfully deleted event (ID: {event_id}) from calendar "
+        f"'{calendar_id}' for {user_google_email}.\nNotifications: {send_updates}."
+    )
     logger.info(f"Event deleted successfully for {user_google_email}. ID: {event_id}")
     return confirmation_message
 
@@ -1276,7 +1410,10 @@ async def _rsvp_event_impl(
     logger.info(
         f"[rsvp_event] RSVP for '{summary}' (ID: {event_id}) set to '{response}' for {user_google_email}."
     )
-    return f"Successfully updated RSVP for '{summary}' (ID: {event_id}) to '{response}' for {user_google_email}."
+    return (
+        f"Successfully updated RSVP for '{summary}' (ID: {event_id}) to "
+        f"'{response}' for {user_google_email}.\nNotifications: {send_updates}."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1314,6 +1451,7 @@ async def manage_event(
     response: Optional[str] = None,
     rsvp_comment: Optional[str] = None,
     send_updates: Optional[str] = None,
+    edit_scope: Optional[str] = None,
 ) -> str:
     """
     Manages calendar events. Supports creating, updating, deleting, and RSVP.
@@ -1324,7 +1462,7 @@ async def manage_event(
         summary (Optional[str]): Event title (required for create).
         start_time (Optional[str]): Start time in RFC3339 format (required for create).
         end_time (Optional[str]): End time in RFC3339 format (required for create).
-        event_id (Optional[str]): Event ID (required for update and delete).
+        event_id (Optional[str]): Event ID. Required for update, delete, and RSVP. For create, an optional caller-supplied ID; reusing it makes retries idempotent.
         calendar_id (str): Calendar ID (default: 'primary').
         description (Optional[str]): Event description.
         location (Optional[str]): Event location.
@@ -1344,6 +1482,7 @@ async def manage_event(
         response (Optional[str]): RSVP response — "accepted", "declined", "tentative", or "needsAction" (rsvp action only).
         rsvp_comment (Optional[str]): Optional message to include with the RSVP response (rsvp action only).
         send_updates (Optional[str]): Notification behavior for create, update, delete, and rsvp — "all" (default), "externalOnly", or "none".
+        edit_scope (Optional[str]): Update only. "instance" edits the supplied occurrence, "series" edits the whole recurring series. Required when the ID is a recurring instance so a single-occurrence edit cannot silently widen.
 
     Returns:
         str: Confirmation message with event details.
@@ -1357,17 +1496,30 @@ async def manage_event(
                 f"Invalid send_updates '{send_updates}'. Must be one of: {sorted(valid_send_updates)}"
             )
 
+    if edit_scope is not None:
+        if edit_scope not in ("series", "instance"):
+            raise ValueError("edit_scope must be 'series' or 'instance'")
+        if action_lower != "update":
+            raise ValueError("edit_scope is only valid for update")
+
     if action_lower == "create":
         if not summary or not start_time or not end_time:
             raise ValueError(
                 "summary, start_time, and end_time are required for create action"
             )
+        if recurrence and not timezone:
+            raise ValueError(
+                "Recurring events require an IANA timezone, for example "
+                "America/New_York."
+            )
+        _validate_timed_write_timezone(start_time, end_time, timezone, "create")
         return await _create_event_impl(
             service=service,
             user_google_email=user_google_email,
             summary=summary,
             start_time=start_time,
             end_time=end_time,
+            event_id=event_id,
             calendar_id=calendar_id,
             description=description,
             location=location,
@@ -1390,10 +1542,17 @@ async def manage_event(
     elif action_lower == "update":
         if not event_id:
             raise ValueError("event_id is required for update action")
+        if recurrence and not timezone:
+            raise ValueError(
+                "Recurring events require an IANA timezone, for example "
+                "America/New_York."
+            )
+        _validate_timed_write_timezone(start_time, end_time, timezone, "update")
         return await _modify_event_impl(
             service=service,
             user_google_email=user_google_email,
             event_id=event_id,
+            edit_scope=edit_scope,
             calendar_id=calendar_id,
             summary=summary,
             start_time=start_time,
