@@ -271,12 +271,9 @@ async def get_doc_content(
             drive_service.files().export_media(
                 fileId=document_id,
                 mimeType=effective_export_mime,
-                supportsAllDrives=True,
             )
             if effective_export_mime
-            else drive_service.files().get_media(
-                fileId=document_id, supportsAllDrives=True
-            )
+            else drive_service.files().get_media(fileId=document_id)
         )
 
         fh = io.BytesIO()

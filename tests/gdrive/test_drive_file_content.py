@@ -130,3 +130,51 @@ async def test_get_drive_file_content_image(mock_resolve_image):
     # Verify base64 portion decodes to original bytes
     b64_part = result.split("[base64_image:image/png]")[1].strip()
     assert base64.b64decode(b64_part) == image_bytes
+
+
+# ---------------------------------------------------------------------------
+# Regression: media download calls must not pass supportsAllDrives.
+# files.export and files.get_media reject that parameter; only files.get and
+# files.list accept it. Passing it broke every Drive/Docs download with
+# "Got an unexpected keyword argument supportsAllDrives".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_native_export_omits_supports_all_drives():
+    mock_service = Mock()
+    mock_service.files().export_media.return_value = "req"
+    with patch("gdrive.drive_tools.resolve_drive_item") as m:
+        m.return_value = (
+            "doc123",
+            {
+                "name": "Doc",
+                "mimeType": "application/vnd.google-apps.document",
+                "webViewLink": "https://drive.google.com/file/doc123",
+            },
+        )
+        with _patch_downloader(b"hello world"):
+            result = await _unwrap(get_drive_file_content)(
+                service=mock_service,
+                user_google_email="user@example.com",
+                file_id="doc123",
+            )
+
+    assert "hello world" in result
+    _, kwargs = mock_service.files().export_media.call_args
+    assert "supportsAllDrives" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_binary_download_omits_supports_all_drives(mock_resolve):
+    mock_service = Mock()
+    mock_service.files().get_media.return_value = "req"
+    with _patch_downloader(b"%PDF-1.4 not really"):
+        await _unwrap(get_drive_file_content)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_id="file123",
+        )
+
+    _, kwargs = mock_service.files().get_media.call_args
+    assert "supportsAllDrives" not in kwargs
