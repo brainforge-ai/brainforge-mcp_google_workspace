@@ -22,6 +22,7 @@ READ_TOOLS = [
     "get_messages",
     "search_messages",
     "download_chat_attachment",
+    "find_conversations",
 ]
 WRITE_TOOLS = ["send_message", "create_reaction"]
 

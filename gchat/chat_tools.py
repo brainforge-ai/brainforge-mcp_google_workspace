@@ -7,52 +7,132 @@ This module provides MCP tools for interacting with Google Chat API.
 import base64
 import logging
 import asyncio
-import ssl
+import re
 from typing import List, Optional
 
 import httpx
 from googleapiclient.errors import HttpError
+from googleapiclient.http import HttpRequest
+from googleapiclient.model import JsonModel
 
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
 from core.server import server
-from core.utils import TransientNetworkError, handle_http_errors
+from core.utils import UserInputError, handle_http_errors
 from gchat.chat_helpers import _name_spaces, _resolve_sender
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES = 1
-_SEARCH_MESSAGES_SSL_RETRIES = 3
-_SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS = 1
+_SEARCH_SPACE_TYPES = {
+    "dm": "DIRECT_MESSAGE",
+    "group_chat": "GROUP_CHAT",
+    "space": "SPACE",
+}
+_SEARCH_FILTER_MAX_LENGTH = 1000
+_SEARCH_TEXT_PREVIEW_CHARS = 300
+_FIND_GROUP_CHATS_MAX_USERS = 49
+_CHAT_API_ROOT = "https://chat.googleapis.com/v1/"
 
 
-async def _execute_chat_request(
-    request_factory,
-    *,
-    request_label: str,
-    retries: int = 1,
-    semaphore: Optional[asyncio.Semaphore] = None,
-):
-    """Execute a Chat API request in a worker thread with optional SSL retries."""
-    for attempt in range(retries):
-        try:
-            if semaphore is None:
-                return await asyncio.to_thread(lambda: request_factory().execute())
-            async with semaphore:
-                return await asyncio.to_thread(lambda: request_factory().execute())
-        except ssl.SSLError as e:
-            if attempt == retries - 1:
-                raise
-            delay = _SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS * (2**attempt)
-            logger.warning(
-                "[search_messages] SSL error during %s on attempt %s/%s: %s. Retrying in %s seconds.",
-                request_label,
-                attempt + 1,
-                retries,
-                e,
-                delay,
+def _chat_api_request(
+    chat_service, method: str, path: str, query=None, body=None
+) -> HttpRequest:
+    """Build a request for a Chat method the pinned API client does not know.
+
+    spaces.messages.search and spaces.findGroupChats first appear in
+    google-api-python-client 2.201.0. Sending them over the Chat service's
+    authorized connection keeps every other Google service on the pinned client.
+    Switch to chat_service methods once the pin reaches 2.201.0.
+    """
+    model = JsonModel()
+    headers, _, query_string, payload = model.request({}, {}, query or {}, body)
+    return HttpRequest(
+        chat_service._http,
+        model.response,
+        _CHAT_API_ROOT + path + query_string,
+        method=method,
+        body=payload,
+        headers=headers,
+    )
+
+
+def _user_resource(user: str) -> str:
+    """Accept an email, a user id, or users/{id}, and return users/{...}."""
+    user = user.strip()
+    return user if user.startswith("users/") else f"users/{user}"
+
+
+def _space_resource(space_id: str) -> str:
+    space_id = space_id.strip()
+    return space_id if space_id.startswith("spaces/") else f"spaces/{space_id}"
+
+
+def _quoted(param: str, value: str) -> str:
+    if '"' in value:
+        raise UserInputError(f"{param} cannot contain double quotes.")
+    return f'"{value}"'
+
+
+def _build_search_filter(
+    query: Optional[str],
+    space_id: Optional[str],
+    sender: Optional[str],
+    space_type: Optional[str],
+    mentions_me: bool,
+    has_link: bool,
+    has_attachment: bool,
+    start_time: Optional[str],
+    end_time: Optional[str],
+) -> str:
+    """Build the filter string for spaces.messages.search."""
+    parts = []
+    if query and query.strip():
+        keywords = query.strip()
+        # OR between keywords must be grouped before it is ANDed with field filters.
+        if re.search(r"\bOR\b", keywords):
+            keywords = f"({keywords})"
+        parts.append(keywords)
+    if space_id:
+        parts.append(f"space.name = {_quoted('space_id', _space_resource(space_id))}")
+    if sender:
+        parts.append(f"sender.name = {_quoted('sender', _user_resource(sender))}")
+    if space_type:
+        key = space_type.strip().lower()
+        if key not in _SEARCH_SPACE_TYPES:
+            raise UserInputError(
+                f"space_type must be one of: {', '.join(_SEARCH_SPACE_TYPES)}."
             )
-            await asyncio.sleep(delay)
+        parts.append(f'space.space_type = "{_SEARCH_SPACE_TYPES[key]}"')
+    if mentions_me:
+        parts.append("annotations.user_mentions.user.name:users/me")
+    if has_link:
+        parts.append("has_link()")
+    if has_attachment:
+        parts.append("attachment:*")
+    if start_time:
+        parts.append(f"create_time >= {_quoted('start_time', start_time)}")
+    if end_time:
+        parts.append(f"create_time < {_quoted('end_time', end_time)}")
+    if not parts:
+        raise UserInputError(
+            "Provide a query or at least one filter to search Chat messages."
+        )
+    search_filter = " AND ".join(parts)
+    if len(search_filter) > _SEARCH_FILTER_MAX_LENGTH:
+        raise UserInputError(
+            f"The search is {len(search_filter)} characters; Chat allows "
+            f"{_SEARCH_FILTER_MAX_LENGTH}. Shorten the query."
+        )
+    return search_filter
+
+
+def _message_space(msg: dict) -> Optional[str]:
+    """Return the space resource name for a message (spaces/X/messages/Y -> spaces/X)."""
+    space_name = msg.get("space", {}).get("name")
+    if space_name:
+        return space_name
+    parts = msg.get("name", "").split("/")
+    return "/".join(parts[:2]) if len(parts) >= 2 and parts[0] == "spaces" else None
 
 
 def _extract_rich_links(msg: dict) -> List[str]:
@@ -302,7 +382,11 @@ async def send_message(
 @server.tool()
 @require_multiple_services(
     [
-        {"service_type": "chat", "scopes": "chat_read", "param_name": "chat_service"},
+        {
+            "service_type": "chat",
+            "scopes": ["chat_read", "chat_spaces_readonly"],
+            "param_name": "chat_service",
+        },
         {
             "service_type": "people",
             "scopes": "contacts_read",
@@ -317,169 +401,202 @@ async def search_messages(
     user_google_email: str,
     query: Optional[str] = None,
     space_id: Optional[str] = None,
+    sender: Optional[str] = None,
+    space_type: Optional[str] = None,
+    mentions_me: bool = False,
+    has_link: bool = False,
+    has_attachment: bool = False,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
     page_size: int = 25,
-    time_filter: Optional[str] = None,
-    max_spaces: int = 10,
+    page_token: Optional[str] = None,
 ) -> str:
     """
-    Searches for messages in Google Chat spaces by text content and/or time range.
+    Searches Google Chat messages across every space, group chat, and direct message you belong to.
+
+    Uses Google Chat's own search. Combine keywords with any of the filters; at least
+    one is required. Search skips messages posted by Chat apps, spaces you muted, and
+    private messages, so use get_messages to read a space in full.
 
     Args:
-        query: Optional text to search for. If omitted, only time_filter is applied.
-        space_id: Optional space to restrict the search to.
-        page_size: Maximum number of messages to return per space.
-        time_filter: Optional filter using Chat API createTime syntax.
-                     Examples:
-                       'createTime > "2026-03-18T00:00:00-03:00"'
-                       'createTime > "2026-03-18T00:00:00-03:00" AND createTime < "2026-03-19T00:00:00-03:00"'
-        max_spaces: Maximum number of spaces to search when space_id is not provided (default 10).
+        query: Keywords to find in message text. Words must all match; wrap a phrase
+               in double quotes, e.g. '"quarterly report" budget'.
+        space_id: Limit to one space, e.g. 'spaces/AAAAxxxx'.
+        sender: Only messages from this person, by email or 'users/{id}'.
+        space_type: Limit to 'dm', 'group_chat', or 'space'.
+        mentions_me: Only messages that @mention you.
+        has_link: Only messages that contain a link.
+        has_attachment: Only messages with an attachment.
+        start_time: Only messages created at or after this RFC 3339 time, e.g. '2026-10-01T00:00:00Z'.
+        end_time: Only messages created before this RFC 3339 time.
+        page_size: Messages per page, up to 100.
+        page_token: Token from a previous call, to fetch the next page.
 
     Returns:
-        str: A formatted list of messages matching the search criteria.
+        str: Matching messages with their space, sender, time, and message ID.
     """
+    search_filter = _build_search_filter(
+        query,
+        space_id,
+        sender,
+        space_type,
+        mentions_me,
+        has_link,
+        has_attachment,
+        start_time,
+        end_time,
+    )
     logger.info(
-        f"[search_messages] Email={user_google_email}, Query='{query}', TimeFilter='{time_filter}'"
+        f"[search_messages] Email={user_google_email}, Filter='{search_filter}'"
     )
 
-    # Google Chat messages.list supports time/thread filters, but not full-text
-    # search. Apply only supported API filters, then filter message text below.
-    filter_parts = []
-    if time_filter:
-        filter_parts.append(time_filter)
-    filter_str = " AND ".join(filter_parts) if filter_parts else None
-
-    search_terms = []
-    if query:
-        search_terms.append(f'text "{query}"')
-    if time_filter:
-        search_terms.append(time_filter)
-    search_desc = " and ".join(search_terms) if search_terms else "all messages"
-
-    # If specific space provided, search within that space
-    if space_id:
-        list_params = {"parent": space_id, "pageSize": page_size}
-        if filter_str:
-            list_params["filter"] = filter_str
-        response = await _execute_chat_request(
-            lambda: chat_service.spaces().messages().list(**list_params),
-            request_label=f"fetching messages for {space_id}",
-            retries=_SEARCH_MESSAGES_SSL_RETRIES,
-        )
-        messages = response.get("messages", [])
-        context = f"space '{space_id}'"
-    else:
-        # Search across all accessible spaces
-        spaces_response = await _execute_chat_request(
-            lambda: chat_service.spaces().list(pageSize=100),
-            request_label="listing accessible spaces",
-            retries=_SEARCH_MESSAGES_SSL_RETRIES,
-        )
-        spaces = spaces_response.get("spaces", [])
-        spaces_to_search = spaces[:max_spaces]
-        fetch_semaphore = asyncio.Semaphore(
-            _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES
-        )
-
-        async def fetch_space_messages(space: dict) -> tuple[List[dict], bool]:
-            try:
-                list_params = {"parent": space.get("name"), "pageSize": page_size}
-                if filter_str:
-                    list_params["filter"] = filter_str
-                response = await _execute_chat_request(
-                    lambda: chat_service.spaces().messages().list(**list_params),
-                    request_label=f"fetching messages for {space.get('name')}",
-                    retries=_SEARCH_MESSAGES_SSL_RETRIES,
-                    semaphore=fetch_semaphore,
-                )
-                msgs = response.get("messages", [])
-                for msg in msgs:
-                    msg["_space"] = space
-                return msgs, False
-            except HttpError as e:
-                logger.debug(
-                    "Skipping space %s during search: %s", space.get("name"), e
-                )
-                return [], False
-            except ssl.SSLError as e:
-                logger.warning(
-                    "Skipping space %s during search after repeated SSL failures: %s",
-                    space.get("name"),
-                    e,
-                )
-                return [], True
-
-        results = await asyncio.gather(
-            *(fetch_space_messages(space) for space in spaces_to_search)
-        )
-        transient_failures = 0
-        messages = []
-        for batch, had_transient_failure in results:
-            messages.extend(batch)
-            transient_failures += int(had_transient_failure)
-        if spaces_to_search and transient_failures == len(spaces_to_search):
-            raise TransientNetworkError(
-                "A transient SSL error occurred in 'search_messages' while searching Chat spaces. "
-                "Please try again shortly."
-            )
-        context = "all accessible spaces"
-
-    # Client-side text filtering (text: operator is not supported by the API)
-    if query:
-        query_lower = query.lower()
-        messages = [m for m in messages if query_lower in (m.get("text") or "").lower()]
-
+    body = {"filter": search_filter, "pageSize": page_size}
+    if page_token:
+        body["pageToken"] = page_token
+    response = await asyncio.to_thread(
+        _chat_api_request(
+            chat_service, "POST", "spaces/-/messages:search", body=body
+        ).execute
+    )
+    messages = [r["message"] for r in response.get("results", []) if r.get("message")]
     if not messages:
-        suffix = (
-            f" Skipped {transient_failures} spaces due to repeated SSL failures."
-            if "transient_failures" in locals() and transient_failures
-            else ""
-        )
-        return f"No messages found matching '{search_desc}' in {context}.{suffix}"
+        return f"No messages found matching: {search_filter}"
 
-    # Resolve senders sequentially. The underlying googleapiclient/httplib2
-    # service objects are not safe to fan out heavily and can trigger SSL churn.
-    sender_lookup = {}
-    for msg in messages:
-        s = msg.get("sender", {})
-        key = s.get("name", "")
-        if key and key not in sender_lookup:
-            sender_lookup[key] = s
+    # Results carry only the space resource name, so fetch each space once for its
+    # label. One request at a time: googleapiclient/httplib2 service objects are not
+    # safe to fan out and can trigger SSL churn.
+    spaces = []
+    for space_name in dict.fromkeys(filter(None, map(_message_space, messages))):
+        try:
+            spaces.append(
+                await asyncio.to_thread(
+                    chat_service.spaces().get(name=space_name).execute
+                )
+            )
+        except HttpError as e:
+            logger.debug(f"Could not get space {space_name}: {e}")
+            spaces.append({"name": space_name})
+    space_labels = await _name_spaces(chat_service, people_service, spaces)
+
     sender_map = {}
-    for key, sender_obj in sender_lookup.items():
-        sender_map[key] = await _resolve_sender(people_service, sender_obj)
-
-    space_names = await _name_spaces(
-        chat_service,
-        people_service,
-        [msg["_space"] for msg in messages if msg.get("_space")],
-    )
-
-    output = [f"Found {len(messages)} messages matching '{search_desc}' in {context}:"]
     for msg in messages:
         sender_obj = msg.get("sender", {})
-        sender_key = sender_obj.get("name", "")
-        sender = sender_map.get(sender_key) or await _resolve_sender(
+        key = sender_obj.get("name", "")
+        if key and key not in sender_map:
+            sender_map[key] = await _resolve_sender(people_service, sender_obj)
+
+    output = [f"Found {len(messages)} messages matching: {search_filter}"]
+    for msg in messages:
+        sender_obj = msg.get("sender", {})
+        sender = sender_map.get(sender_obj.get("name", "")) or await _resolve_sender(
             people_service, sender_obj
         )
         create_time = msg.get("createTime", "Unknown Time")
-        text_content = msg.get("text", "No text content")
-        space_name = space_names.get(msg.get("_space", {}).get("name"), "Unknown Space")
+        space_label = space_labels.get(_message_space(msg), "Unknown Space")
+        text_content = msg.get("text") or "No text content"
+        if len(text_content) > _SEARCH_TEXT_PREVIEW_CHARS:
+            text_content = text_content[:_SEARCH_TEXT_PREVIEW_CHARS] + "..."
 
-        # Truncate long messages
-        if len(text_content) > 100:
-            text_content = text_content[:100] + "..."
-
-        rich_links = _extract_rich_links(msg)
-        links_suffix = "".join(f" [linked: {url}]" for url in rich_links)
-        attachments = msg.get("attachment", [])
+        links_suffix = "".join(f" [linked: {url}]" for url in _extract_rich_links(msg))
         att_suffix = "".join(
             f" [attachment: {a.get('contentName', 'unnamed')} ({a.get('contentType', 'unknown type')})]"
-            for a in attachments
+            for a in msg.get("attachment", [])
         )
         output.append(
-            f"- [{create_time}] {sender} in '{space_name}': {text_content}{links_suffix}{att_suffix}"
+            f"- [{create_time}] {sender} in '{space_label}': {text_content}{links_suffix}{att_suffix}"
         )
+        details = f"  (Message ID: {msg.get('name', '')}"
+        thread = msg.get("thread", {})
+        if msg.get("threadReply") and thread.get("name"):
+            details += f", thread: {thread['name']}"
+        output.append(details + ")")
 
+    next_page_token = response.get("nextPageToken")
+    if next_page_token:
+        output.append(
+            f"\nMore results available. Call again with page_token='{next_page_token}'."
+        )
+    return "\n".join(output)
+
+
+@server.tool()
+@require_multiple_services(
+    [
+        {
+            "service_type": "chat",
+            "scopes": ["chat_spaces_readonly", "chat_memberships_readonly"],
+            "param_name": "chat_service",
+        },
+        {
+            "service_type": "people",
+            "scopes": "contacts_read",
+            "param_name": "people_service",
+        },
+    ]
+)
+@handle_http_errors("find_conversations", is_read_only=True, service_type="chat")
+async def find_conversations(
+    chat_service,
+    people_service,
+    user_google_email: str,
+    participants: List[str],
+) -> str:
+    """
+    Finds your direct message or group chats with specific people.
+
+    Args:
+        participants: The other people, by email or 'users/{id}'. With one person,
+                      returns your direct message with them. With several, returns
+                      group chats whose members are exactly you and those people.
+
+    Returns:
+        str: Matching conversations with the space IDs that get_messages and
+             search_messages accept.
+    """
+    people = [_user_resource(p) for p in participants if p and p.strip()]
+    if not people:
+        raise UserInputError("Provide at least one participant.")
+    if len(people) > _FIND_GROUP_CHATS_MAX_USERS:
+        raise UserInputError(
+            f"Chat can match at most {_FIND_GROUP_CHATS_MAX_USERS} other participants."
+        )
+    logger.info(f"[find_conversations] Email={user_google_email}, People={people}")
+
+    if len(people) == 1:
+        try:
+            space = await asyncio.to_thread(
+                chat_service.spaces().findDirectMessage(name=people[0]).execute
+            )
+        except HttpError as e:
+            if e.resp.status == 404:
+                return f"No direct message found with {people[0]}."
+            raise
+        spaces = [space]
+    else:
+        response = await asyncio.to_thread(
+            _chat_api_request(
+                chat_service,
+                "GET",
+                "spaces:findGroupChats",
+                query={
+                    "users": people,
+                    "spaceView": "SPACE_VIEW_EXPANDED",
+                    "pageSize": 30,
+                },
+            ).execute
+        )
+        spaces = response.get("spaces", [])
+        if not spaces:
+            return f"No group chats found with exactly you and {', '.join(people)}."
+
+    labels = await _name_spaces(chat_service, people_service, spaces)
+    output = [f"Found {len(spaces)} conversation(s):"]
+    for space in spaces:
+        space_name = space.get("name", "")
+        output.append(
+            f"- {labels.get(space_name, 'Unnamed Space')} "
+            f"({space.get('spaceType', 'UNKNOWN')}, ID: {space_name})"
+        )
     return "\n".join(output)
 
 

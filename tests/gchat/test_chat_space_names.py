@@ -1,11 +1,13 @@
 """Unit tests for naming Google Chat spaces that have no displayName."""
 
+import json
 import ssl
 from unittest.mock import Mock
 
 import httplib2
 import pytest
 from googleapiclient.errors import HttpError
+from googleapiclient.http import HttpMockSequence
 
 from gchat import chat_helpers
 from gchat.chat_tools import get_messages, list_spaces, search_messages
@@ -119,6 +121,13 @@ def _chat_service(spaces, members=None, members_error=None, messages=None):
     )
     chat_service.spaces().messages().list.side_effect = lambda parent, **kw: _request(
         {"messages": (messages or {}).get(parent, [])}
+    )
+    # Chat search runs server-side; the fake returns every message as a match.
+    search_results = [
+        {"message": m} for msgs in (messages or {}).values() for m in msgs
+    ]
+    chat_service._http = HttpMockSequence(
+        [({"status": "200"}, json.dumps({"results": search_results}))]
     )
     chat_service.spaces().members().list.side_effect = list_members
     return chat_service
@@ -394,7 +403,9 @@ async def test_search_messages_names_each_direct_message_space_once():
 
 
 @pytest.mark.asyncio
-async def test_search_messages_names_space_after_sender_lookup_failed():
+async def test_search_messages_names_sender_from_space_lookup_when_person_get_fails():
+    # search_messages names spaces before senders, so the batched member lookup
+    # also names the sender and the failing per-person lookup is never needed.
     chat_service = _chat_service(
         [DM_SPACE], messages={"spaces/DM1": [_message("spaces/DM1", "deploy?")]}
     )
@@ -414,7 +425,11 @@ async def test_search_messages_names_space_after_sender_lookup_failed():
         query="deploy",
     )
 
-    assert "users/200 in 'Alice Smith': deploy?" in result
+    assert "Alice Smith in 'Alice Smith': deploy?" in result
+    looked_up = [
+        c.kwargs["resourceName"] for c in people_service.people().get.call_args_list
+    ]
+    assert looked_up == ["people/me"]
 
 
 @pytest.mark.asyncio

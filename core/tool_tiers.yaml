@@ -106,6 +106,7 @@ chat:
     - get_messages
     - search_messages
     - create_reaction
+    - find_conversations
   extended:
     - list_spaces
     - download_chat_attachment
