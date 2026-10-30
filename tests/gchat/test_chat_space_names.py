@@ -442,3 +442,62 @@ async def test_resolve_sender_falls_back_to_email_when_person_has_no_name():
     name = await chat_helpers._resolve_sender(people_service, {"name": "users/200"})
 
     assert name == "alice@example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "space_type, expected_filter",
+    [
+        ("all", None),
+        ("space", 'spaceType = "SPACE"'),
+        ("room", 'spaceType = "SPACE"'),
+        ("group_chat", 'spaceType = "GROUP_CHAT"'),
+        ("DM", 'spaceType = "DIRECT_MESSAGE"'),
+    ],
+)
+async def test_list_spaces_filters_by_space_type(space_type, expected_filter):
+    chat_service = _chat_service([NAMED_SPACE])
+
+    await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=_people_service(),
+        user_google_email=SELF_EMAIL,
+        space_type=space_type,
+    )
+
+    list_kwargs = chat_service.spaces().list.call_args.kwargs
+    assert list_kwargs.get("filter") == expected_filter
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_rejects_unknown_space_type():
+    from core.utils import UserInputError
+
+    chat_service = _chat_service([NAMED_SPACE])
+
+    with pytest.raises(UserInputError):
+        await _unwrap(list_spaces)(
+            chat_service=chat_service,
+            people_service=_people_service(),
+            user_google_email=SELF_EMAIL,
+            space_type="channel",
+        )
+    chat_service.spaces().list.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_pages_with_token():
+    chat_service = _chat_service([NAMED_SPACE])
+    chat_service.spaces().list.side_effect = lambda **kw: _request(
+        {"spaces": [NAMED_SPACE], "nextPageToken": "PAGE3"}
+    )
+
+    result = await _unwrap(list_spaces)(
+        chat_service=chat_service,
+        people_service=_people_service(),
+        user_google_email=SELF_EMAIL,
+        page_token="PAGE2",
+    )
+
+    assert chat_service.spaces().list.call_args.kwargs["pageToken"] == "PAGE2"
+    assert "Call again with page_token='PAGE3'" in result

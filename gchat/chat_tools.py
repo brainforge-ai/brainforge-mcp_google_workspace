@@ -8,6 +8,7 @@ import base64
 import logging
 import asyncio
 import re
+from datetime import datetime
 from typing import List, Optional
 
 import httpx
@@ -28,6 +29,11 @@ _SEARCH_SPACE_TYPES = {
     "group_chat": "GROUP_CHAT",
     "space": "SPACE",
 }
+# list_spaces also accepts its older name for named spaces, "room".
+_LIST_SPACE_TYPES = {"all": None, **_SEARCH_SPACE_TYPES, "room": "SPACE"}
+_RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$", re.IGNORECASE
+)
 _SEARCH_FILTER_MAX_LENGTH = 1000
 _SEARCH_TEXT_PREVIEW_CHARS = 300
 _FIND_GROUP_CHATS_MAX_USERS = 49
@@ -73,6 +79,35 @@ def _quoted(param: str, value: str) -> str:
     return f'"{value}"'
 
 
+def _rfc3339(param: str, value: str) -> str:
+    """Reject times Chat would answer with a bare INVALID_ARGUMENT."""
+    value = value.strip()
+    try:
+        if not _RFC3339.match(value):
+            raise ValueError
+        datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        raise UserInputError(
+            f"{param} must be an RFC 3339 time, e.g. '2026-10-01T00:00:00Z'."
+        ) from None
+    return value
+
+
+def _drive_attachment_hint(att: dict) -> Optional[str]:
+    """For a Drive file attached to a message, say how to read it.
+
+    Drive attachments have no Chat media to download; their content lives in Drive.
+    """
+    file_id = att.get("driveDataRef", {}).get("driveFileId")
+    if file_id:
+        return f"get_drive_file_content(file_id='{file_id}')"
+    if att.get("source") == "DRIVE_FILE" or att.get("contentType", "").startswith(
+        "application/vnd.google-apps."
+    ):
+        return "search_drive_files with the file name"
+    return None
+
+
 def _build_search_filter(
     query: Optional[str],
     space_id: Optional[str],
@@ -110,9 +145,9 @@ def _build_search_filter(
     if has_attachment:
         parts.append("attachment:*")
     if start_time:
-        parts.append(f"create_time >= {_quoted('start_time', start_time)}")
+        parts.append(f'create_time >= "{_rfc3339("start_time", start_time)}"')
     if end_time:
-        parts.append(f"create_time < {_quoted('end_time', end_time)}")
+        parts.append(f'create_time < "{_rfc3339("end_time", end_time)}"')
     if not parts:
         raise UserInputError(
             "Provide a query or at least one filter to search Chat messages."
@@ -173,26 +208,31 @@ async def list_spaces(
     people_service,
     user_google_email: str,
     page_size: int = 100,
-    space_type: str = "all",  # "all", "room", "dm"
+    space_type: str = "all",
+    page_token: Optional[str] = None,
 ) -> str:
     """
     Lists Google Chat spaces (rooms and direct messages) accessible to the user.
+
+    Args:
+        page_size: Spaces per page, up to 1000.
+        space_type: 'all' (default), 'space', 'group_chat', or 'dm'. 'room' also
+                    means 'space'.
+        page_token: Token from a previous call, to fetch the next page.
 
     Returns:
         str: A formatted list of Google Chat spaces accessible to the user.
     """
     logger.info(f"[list_spaces] Email={user_google_email}, Type={space_type}")
 
-    # Build filter based on space_type
-    filter_param = None
-    if space_type == "room":
-        filter_param = "spaceType = SPACE"
-    elif space_type == "dm":
-        filter_param = "spaceType = DIRECT_MESSAGE"
-
+    key = (space_type or "all").strip().lower()
+    if key not in _LIST_SPACE_TYPES:
+        raise UserInputError("space_type must be one of: all, space, group_chat, dm.")
     request_params = {"pageSize": page_size}
-    if filter_param:
-        request_params["filter"] = filter_param
+    if _LIST_SPACE_TYPES[key]:
+        request_params["filter"] = f'spaceType = "{_LIST_SPACE_TYPES[key]}"'
+    if page_token:
+        request_params["pageToken"] = page_token
 
     response = await asyncio.to_thread(
         chat_service.spaces().list(**request_params).execute
@@ -210,6 +250,11 @@ async def list_spaces(
         space_type_actual = space.get("spaceType", "UNKNOWN")
         output.append(f"- {space_name} (ID: {space_id}, Type: {space_type_actual})")
 
+    next_page_token = response.get("nextPageToken")
+    if next_page_token:
+        output.append(
+            f"\nMore spaces available. Call again with page_token='{next_page_token}'."
+        )
     return "\n".join(output)
 
 
@@ -233,11 +278,14 @@ async def get_messages(
     page_size: int = 50,
     order_by: str = "createTime desc",
     message_filter: Optional[str] = None,
+    page_token: Optional[str] = None,
 ) -> str:
     """
     Retrieves messages from a Google Chat space.
 
     Args:
+        page_size: Messages per page, up to 1000.
+        page_token: Token from a previous call, to fetch the next page.
         message_filter: Optional filter string using the Chat API filter syntax.
                         Supports createTime and thread.name.
                         Examples:
@@ -261,6 +309,8 @@ async def get_messages(
     list_params = {"parent": space_id, "pageSize": page_size, "orderBy": order_by}
     if message_filter is not None:
         list_params["filter"] = message_filter
+    if page_token:
+        list_params["pageToken"] = page_token
     response = await asyncio.to_thread(
         chat_service.spaces().messages().list(**list_params).execute
     )
@@ -304,7 +354,10 @@ async def get_messages(
             att_type = att.get("contentType", "unknown type")
             att_resource = att.get("name", "")
             output.append(f"  [attachment {idx}: {att_name} ({att_type})]")
-            if att_resource:
+            drive_hint = _drive_attachment_hint(att)
+            if drive_hint:
+                output.append(f"  Google Drive file: read it with {drive_hint}")
+            elif att_resource:
                 output.append(
                     f"  Use download_chat_attachment(message_id='{msg_name}', attachment_index={idx}) to download"
                 )
@@ -327,6 +380,11 @@ async def get_messages(
             output.append(f"  [reactions: {', '.join(parts)}]")
         output.append(f"  (Message ID: {msg_name})\n")
 
+    next_page_token = response.get("nextPageToken")
+    if next_page_token:
+        output.append(
+            f"More messages available. Call again with page_token='{next_page_token}'."
+        )
     return "\n".join(output)
 
 
@@ -460,6 +518,9 @@ async def search_messages(
     )
     messages = [r["message"] for r in response.get("results", []) if r.get("message")]
     if not messages:
+        # Chat can return a page token even when the next page turns out empty.
+        if page_token:
+            return f"No more messages matching: {search_filter}"
         return f"No messages found matching: {search_filter}"
 
     # Results carry only the space resource name, so fetch each space once for its
@@ -570,21 +631,35 @@ async def find_conversations(
         except HttpError as e:
             if e.resp.status == 404:
                 return f"No direct message found with {people[0]}."
+            # Chat answers 400 for an address that is not a Chat user.
+            if e.resp.status == 400:
+                return (
+                    f"Google Chat does not recognize {people[0]}. "
+                    "Check the email address."
+                )
             raise
         spaces = [space]
     else:
-        response = await asyncio.to_thread(
-            _chat_api_request(
-                chat_service,
-                "GET",
-                "spaces:findGroupChats",
-                query={
-                    "users": people,
-                    "spaceView": "SPACE_VIEW_EXPANDED",
-                    "pageSize": 30,
-                },
-            ).execute
-        )
+        try:
+            response = await asyncio.to_thread(
+                _chat_api_request(
+                    chat_service,
+                    "GET",
+                    "spaces:findGroupChats",
+                    query={
+                        "users": people,
+                        "spaceView": "SPACE_VIEW_EXPANDED",
+                        "pageSize": 30,
+                    },
+                ).execute
+            )
+        except HttpError as e:
+            if e.resp.status == 400:
+                return (
+                    "Google Chat does not recognize at least one of "
+                    f"{', '.join(people)}. Check the email addresses."
+                )
+            raise
         spaces = response.get("spaces", [])
         if not spaces:
             return f"No group chats found with exactly you and {', '.join(people)}."
@@ -681,6 +756,13 @@ async def download_chat_attachment(
     filename = att.get("contentName", "attachment")
     content_type = att.get("contentType", "application/octet-stream")
     source = att.get("source", "")
+
+    drive_hint = _drive_attachment_hint(att)
+    if drive_hint:
+        return (
+            f"Attachment '{filename}' is a Google Drive file, which Chat cannot "
+            f"download. Read it with {drive_hint}."
+        )
 
     # The media endpoint needs attachmentDataRef.resourceName (e.g.
     # "spaces/S/attachments/A"), NOT the attachment name which includes
