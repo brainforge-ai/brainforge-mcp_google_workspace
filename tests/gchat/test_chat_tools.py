@@ -2,13 +2,13 @@
 Unit tests for Google Chat MCP tools — attachment support
 """
 
-import asyncio
 import base64
 import inspect
-import ssl
-from urllib.parse import urlparse
+import json
+from urllib.parse import parse_qs, urlparse
 
 import pytest
+from googleapiclient.http import HttpMockSequence
 from unittest.mock import AsyncMock, Mock, patch
 import sys
 import os
@@ -44,6 +44,16 @@ def _make_attachment(
     if resource_name:
         att["attachmentDataRef"] = {"resourceName": resource_name}
     return att
+
+
+def _make_drive_attachment(file_id="FILE1"):
+    return {
+        "name": "spaces/S/messages/M/attachments/D",
+        "contentName": "Budget",
+        "contentType": "application/vnd.google-apps.spreadsheet",
+        "source": "DRIVE_FILE",
+        "driveDataRef": {"driveFileId": file_id},
+    }
 
 
 def _unwrap(tool):
@@ -182,251 +192,414 @@ async def test_get_messages_exposes_message_filter_and_forwards_it(mock_resolve)
     assert list_kwargs["filter"] == "thread.name = spaces/S/threads/T"
 
 
-# ---------------------------------------------------------------------------
-# search_messages: attachment indicator
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_get_messages_pages_with_token(mock_resolve):
+    mock_resolve.return_value = "Test User"
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {"displayName": "Test Space"}
+    chat_service.spaces().messages().list().execute.return_value = {
+        "messages": [_make_message()],
+        "nextPageToken": "PAGE3",
+    }
+
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=Mock(),
+        user_google_email="test@example.com",
+        space_id="spaces/S",
+        page_token="PAGE2",
+    )
+
+    list_kwargs = chat_service.spaces().messages().list.call_args.kwargs
+    assert list_kwargs["pageToken"] == "PAGE2"
+    assert "Call again with page_token='PAGE3'" in result
 
 
 @pytest.mark.asyncio
 @patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
-async def test_search_messages_shows_attachment_indicator(mock_resolve):
-    """search_messages should show [attachment: filename] for messages with attachments."""
+async def test_get_messages_points_drive_attachments_to_drive(mock_resolve):
     mock_resolve.return_value = "Test User"
+    msg = _make_message(attachments=[_make_drive_attachment()])
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {"displayName": "Test Space"}
+    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
 
+    from gchat.chat_tools import get_messages
+
+    result = await _unwrap(get_messages)(
+        chat_service=chat_service,
+        people_service=Mock(),
+        user_google_email="test@example.com",
+        space_id="spaces/S",
+    )
+
+    assert "[attachment 0: Budget (application/vnd.google-apps.spreadsheet)]" in result
+    assert (
+        "Google Drive file: read it with get_drive_file_content(file_id='FILE1')"
+        in result
+    )
+    assert "download_chat_attachment" not in result
+
+
+# ---------------------------------------------------------------------------
+# search_messages: Chat API search (spaces.messages.search)
+# ---------------------------------------------------------------------------
+
+
+def _chat_http(*responses):
+    """Fake authorized HTTP that answers each request with the next (status, body)."""
+    return HttpMockSequence(
+        [({"status": str(status)}, json.dumps(body)) for status, body in responses]
+    )
+
+
+def _sent_requests(chat_service):
+    """(method, path, query, body) of each request sent over the Chat connection."""
+    sent = []
+    for uri, method, body, _ in chat_service._http.request_sequence:
+        url = urlparse(uri)
+        sent.append(
+            (method, url.path, parse_qs(url.query), json.loads(body) if body else None)
+        )
+    return sent
+
+
+def _search_service(messages, spaces=None, next_page_token=None):
+    """Chat service whose search returns `messages` and whose spaces.get returns `spaces`."""
+    chat_service = Mock()
+    response = {"results": [{"message": m} for m in messages]}
+    if next_page_token:
+        response["nextPageToken"] = next_page_token
+    chat_service._http = _chat_http((200, response))
+    by_name = {s["name"]: s for s in (spaces or [])}
+    chat_service.spaces().get.side_effect = lambda name: Mock(
+        execute=Mock(return_value=by_name.get(name, {"name": name}))
+    )
+    return chat_service
+
+
+async def _search(chat_service, **kwargs):
+    from gchat.chat_tools import search_messages
+
+    return await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=Mock(),
+        user_google_email="test@example.com",
+        **kwargs,
+    )
+
+
+def _search_body(chat_service):
+    [(_, _, _, body)] = _sent_requests(chat_service)
+    return body
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_search_messages_searches_all_spaces_server_side(
+    mock_resolve, mock_name_spaces
+):
+    mock_resolve.return_value = "Test User"
+    mock_name_spaces.return_value = {"spaces/S": "General"}
+    msg = _make_message(text="Deploy finished")
+    chat_service = _search_service(
+        [msg], spaces=[{"name": "spaces/S", "displayName": "General"}]
+    )
+
+    result = await _search(chat_service, query="deploy")
+
+    assert _sent_requests(chat_service) == [
+        (
+            "POST",
+            "/v1/spaces/-/messages:search",
+            {"alt": ["json"]},
+            {"filter": "deploy", "pageSize": 25},
+        )
+    ]
+    assert "Found 1 messages matching: deploy" in result
+    assert "Test User in 'General': Deploy finished" in result
+    assert "(Message ID: spaces/S/messages/M)" in result
+    chat_service.spaces().messages().list.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_search_messages_builds_filter_from_every_option(
+    mock_resolve, mock_name_spaces
+):
+    mock_resolve.return_value = "Test User"
+    mock_name_spaces.return_value = {}
+    chat_service = _search_service([_make_message()])
+
+    await _search(
+        chat_service,
+        query='"quarterly report" budget',
+        space_id="AAAA",
+        sender="alice@example.com",
+        space_type="dm",
+        mentions_me=True,
+        has_link=True,
+        has_attachment=True,
+        start_time="2026-10-01T00:00:00Z",
+        end_time="2026-10-29T00:00:00Z",
+        page_size=7,
+        page_token="NEXT",
+    )
+
+    assert _search_body(chat_service) == {
+        "filter": (
+            '"quarterly report" budget'
+            ' AND space.name = "spaces/AAAA"'
+            ' AND sender.name = "users/alice@example.com"'
+            ' AND space.space_type = "DIRECT_MESSAGE"'
+            " AND annotations.user_mentions.user.name:users/me"
+            " AND has_link()"
+            " AND attachment:*"
+            ' AND create_time >= "2026-10-01T00:00:00Z"'
+            ' AND create_time < "2026-10-29T00:00:00Z"'
+        ),
+        "pageSize": 7,
+        "pageToken": "NEXT",
+    }
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_search_messages_groups_or_keywords_before_field_filters(
+    mock_resolve, mock_name_spaces
+):
+    mock_resolve.return_value = "Test User"
+    mock_name_spaces.return_value = {}
+    chat_service = _search_service([_make_message()])
+
+    await _search(chat_service, query="budget OR forecast", sender="users/123")
+
+    assert (
+        _search_body(chat_service)["filter"]
+        == '(budget OR forecast) AND sender.name = "users/123"'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"query": "   "},
+        {"query": "deploy", "space_type": "channel"},
+        {"sender": 'alice" OR sender.name = "users/1'},
+        {"query": "x" * 1001},
+        {"query": "deploy", "start_time": "yesterday"},
+        {"query": "deploy", "end_time": "2026-10-01"},
+        {"query": "deploy", "start_time": "2026-13-01T00:00:00Z"},
+    ],
+)
+async def test_search_messages_rejects_bad_input_before_calling_chat(kwargs):
+    from core.utils import UserInputError
+
+    chat_service = _search_service([])
+
+    with pytest.raises(UserInputError):
+        await _search(chat_service, **kwargs)
+    assert _sent_requests(chat_service) == []
+
+
+@pytest.mark.asyncio
+async def test_search_messages_reports_no_matches():
+    chat_service = _search_service([])
+
+    result = await _search(chat_service, query="nothing", mentions_me=True)
+
+    assert result == (
+        "No messages found matching: nothing"
+        " AND annotations.user_mentions.user.name:users/me"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_messages_says_when_a_later_page_is_empty():
+    chat_service = _search_service([])
+
+    result = await _search(chat_service, query="report", page_token="PAGE2")
+
+    assert result == "No more messages matching: report"
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_search_messages_shows_attachment_thread_and_next_page(
+    mock_resolve, mock_name_spaces
+):
+    mock_resolve.return_value = "Test User"
+    mock_name_spaces.return_value = {"spaces/S": "General"}
     att = _make_attachment(content_name="report.pdf", content_type="application/pdf")
     msg = _make_message(text="Here is the report", attachments=[att])
-    msg["_space_name"] = "General"
+    msg["threadReply"] = True
+    msg["thread"] = {"name": "spaces/S/threads/T"}
+    chat_service = _search_service([msg], next_page_token="PAGE2")
 
-    chat_service = Mock()
-    chat_service.spaces().list().execute.return_value = {
-        "spaces": [{"name": "spaces/S", "displayName": "General"}]
-    }
-    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
-
-    people_service = Mock()
-
-    from gchat.chat_tools import search_messages
-
-    result = await _unwrap(search_messages)(
-        chat_service=chat_service,
-        people_service=people_service,
-        user_google_email="test@example.com",
-        query="report",
-    )
+    result = await _search(chat_service, query="report")
 
     assert "[attachment: report.pdf (application/pdf)]" in result
+    assert "(Message ID: spaces/S/messages/M, thread: spaces/S/threads/T)" in result
+    assert "Call again with page_token='PAGE2'" in result
 
 
 @pytest.mark.asyncio
-@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
-async def test_search_messages_combines_filters_and_uses_page_size(mock_resolve):
-    """Cross-space search should honor page_size and only send supported API filters."""
-    mock_resolve.return_value = "Test User"
-
-    msg = _make_message(text="Deploy finished")
-    msg["_space_name"] = "General"
+async def test_search_messages_raises_chat_errors():
+    from googleapiclient.errors import HttpError
 
     chat_service = Mock()
-    chat_service.spaces().list().execute.return_value = {
-        "spaces": [{"name": "spaces/S", "displayName": "General"}]
-    }
-    chat_service.spaces().messages().list().execute.return_value = {"messages": [msg]}
-    people_service = Mock()
-
-    from gchat.chat_tools import search_messages
-
-    result = await _unwrap(search_messages)(
-        chat_service=chat_service,
-        people_service=people_service,
-        user_google_email="test@example.com",
-        query="deploy",
-        time_filter='createTime > "2026-03-18T00:00:00-03:00"',
-        page_size=7,
+    chat_service._http = _chat_http(
+        (400, {"error": {"code": 400, "message": "Invalid filter"}})
     )
 
-    assert 'text "deploy" and createTime > "2026-03-18T00:00:00-03:00"' in result
-    list_kwargs = chat_service.spaces().messages().list.call_args.kwargs
-    assert list_kwargs["pageSize"] == 7
-    assert list_kwargs["filter"] == 'createTime > "2026-03-18T00:00:00-03:00"'
+    with pytest.raises(HttpError) as excinfo:
+        await _search(chat_service, query="deploy")
+    assert excinfo.value.resp.status == 400
 
 
 @pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
 @patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
-async def test_search_messages_query_only_filters_client_side_without_api_filter(
-    mock_resolve,
-):
-    """Query-only search should avoid unsupported Chat API text filters."""
+async def test_search_messages_looks_up_each_space_once(mock_resolve, mock_name_spaces):
     mock_resolve.return_value = "Test User"
+    mock_name_spaces.return_value = {}
+    messages = [
+        _make_message(msg_name="spaces/A/messages/1"),
+        _make_message(msg_name="spaces/B/messages/2"),
+        _make_message(msg_name="spaces/A/messages/3"),
+    ]
+    chat_service = _search_service(messages)
 
-    matching = _make_message(text="Deploy finished")
-    matching["_space_name"] = "General"
-    non_matching = _make_message(text="Lunch plans")
-    non_matching["_space_name"] = "General"
+    await _search(chat_service, query="hello")
 
-    chat_service = Mock()
-    chat_service.spaces().list().execute.return_value = {
-        "spaces": [{"name": "spaces/S", "displayName": "General"}]
-    }
-    chat_service.spaces().messages().list().execute.return_value = {
-        "messages": [matching, non_matching]
-    }
-    people_service = Mock()
+    looked_up = [c.kwargs["name"] for c in chat_service.spaces().get.call_args_list]
+    assert looked_up == ["spaces/A", "spaces/B"]
 
-    from gchat.chat_tools import search_messages
 
-    result = await _unwrap(search_messages)(
+# ---------------------------------------------------------------------------
+# find_conversations
+# ---------------------------------------------------------------------------
+
+
+async def _find(chat_service, participants):
+    from gchat.chat_tools import find_conversations
+
+    return await _unwrap(find_conversations)(
         chat_service=chat_service,
-        people_service=people_service,
+        people_service=Mock(),
         user_google_email="test@example.com",
-        query="deploy",
+        participants=participants,
     )
 
-    assert "Deploy finished" in result
-    assert "Lunch plans" not in result
-    list_kwargs = chat_service.spaces().messages().list.call_args.kwargs
-    assert list_kwargs["pageSize"] == 25
-    assert "filter" not in list_kwargs
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
+async def test_find_conversations_returns_direct_message(mock_name_spaces):
+    mock_name_spaces.return_value = {"spaces/DM": "Alice Smith"}
+    chat_service = Mock()
+    chat_service.spaces().findDirectMessage.return_value.execute.return_value = {
+        "name": "spaces/DM",
+        "spaceType": "DIRECT_MESSAGE",
+    }
+
+    result = await _find(chat_service, ["alice@example.com"])
+
+    chat_service.spaces().findDirectMessage.assert_called_with(
+        name="users/alice@example.com"
+    )
+    assert "- Alice Smith (DIRECT_MESSAGE, ID: spaces/DM)" in result
 
 
 @pytest.mark.asyncio
-@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
-async def test_search_messages_limits_parallel_space_fetches(mock_resolve, monkeypatch):
-    """Cross-space search should cap concurrent threaded Chat API calls."""
-    mock_resolve.return_value = "Test User"
-
-    from gchat.chat_tools import _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES
-    from gchat.chat_tools import search_messages
-
-    state = {"current": 0, "max": 0}
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        state["current"] += 1
-        state["max"] = max(state["max"], state["current"])
-        await asyncio.sleep(0.01)
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            state["current"] -= 1
-
-    monkeypatch.setattr("gchat.chat_tools.asyncio.to_thread", fake_to_thread)
-
-    spaces = [{"name": f"spaces/S{i}", "displayName": f"Space {i}"} for i in range(5)]
-
-    def list_messages(**kwargs):
-        parent = kwargs["parent"]
-        request = Mock()
-        request.execute.return_value = {
-            "messages": [_make_message(text=f"message from {parent}")]
-        }
-        return request
+async def test_find_conversations_reports_missing_direct_message():
+    import httplib2
+    from googleapiclient.errors import HttpError
 
     chat_service = Mock()
-    chat_service.spaces().list().execute.return_value = {"spaces": spaces}
-    chat_service.spaces().messages().list.side_effect = list_messages
-    people_service = Mock()
-
-    result = await _unwrap(search_messages)(
-        chat_service=chat_service,
-        people_service=people_service,
-        user_google_email="test@example.com",
-        query="message",
-        max_spaces=len(spaces),
+    chat_service.spaces().findDirectMessage.return_value.execute.side_effect = (
+        HttpError(httplib2.Response({"status": 404}), b"{}")
     )
 
-    assert "Found 5 messages matching 'text \"message\"'" in result
-    assert state["max"] <= _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES
+    result = await _find(chat_service, ["nobody@example.com"])
+
+    assert result == "No direct message found with users/nobody@example.com."
 
 
 @pytest.mark.asyncio
-@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
-async def test_search_messages_retries_ssl_per_space_without_restarting_search(
-    mock_resolve, monkeypatch
-):
-    """A transient SSL failure in one space should retry only that space."""
-    mock_resolve.return_value = "Test User"
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr("gchat.chat_tools.asyncio.to_thread", fake_to_thread)
-    monkeypatch.setattr("gchat.chat_tools.asyncio.sleep", AsyncMock())
-
-    from gchat.chat_tools import search_messages
-
-    attempt_counts = {"spaces/S1": 0, "spaces/S2": 0}
-
-    def list_messages(**kwargs):
-        parent = kwargs["parent"]
-        request = Mock()
-
-        def execute():
-            attempt_counts[parent] += 1
-            if parent == "spaces/S1" and attempt_counts[parent] < 3:
-                raise ssl.SSLError("read operation timed out")
-            return {"messages": [_make_message(text=f"message from {parent}")]}
-
-        request.execute.side_effect = execute
-        return request
+async def test_find_conversations_reports_unknown_person():
+    import httplib2
+    from googleapiclient.errors import HttpError
 
     chat_service = Mock()
-    chat_service.spaces().list().execute.return_value = {
-        "spaces": [
-            {"name": "spaces/S1", "displayName": "Space 1"},
-            {"name": "spaces/S2", "displayName": "Space 2"},
-        ]
-    }
-    chat_service.spaces().messages().list.side_effect = list_messages
-    people_service = Mock()
-
-    result = await _unwrap(search_messages)(
-        chat_service=chat_service,
-        people_service=people_service,
-        user_google_email="test@example.com",
-        query="message",
-        max_spaces=2,
+    chat_service.spaces().findDirectMessage.return_value.execute.side_effect = (
+        HttpError(httplib2.Response({"status": 400}), b"{}")
     )
 
-    assert "Found 2 messages matching 'text \"message\"'" in result
-    assert attempt_counts == {"spaces/S1": 3, "spaces/S2": 1}
-    assert chat_service.spaces().list().execute.call_count == 1
+    result = await _find(chat_service, ["nobody@example.com"])
+
+    assert result == (
+        "Google Chat does not recognize users/nobody@example.com. "
+        "Check the email address."
+    )
 
 
 @pytest.mark.asyncio
-@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
-async def test_search_messages_raises_transient_error_when_all_spaces_ssl_fail(
-    mock_resolve, monkeypatch
-):
-    """If every searched space fails transiently, surface a transient network error."""
-    mock_resolve.return_value = "Test User"
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr("gchat.chat_tools.asyncio.to_thread", fake_to_thread)
-    monkeypatch.setattr("gchat.chat_tools.asyncio.sleep", AsyncMock())
-
-    from core.utils import TransientNetworkError
-    from gchat.chat_tools import search_messages
-
-    def list_messages(**kwargs):  # noqa: ARG001
-        request = Mock()
-        request.execute.side_effect = ssl.SSLError("connection reset")
-        return request
-
+async def test_find_conversations_reports_unknown_person_in_group():
     chat_service = Mock()
-    chat_service.spaces().list().execute.return_value = {
-        "spaces": [{"name": "spaces/S1", "displayName": "Space 1"}]
-    }
-    chat_service.spaces().messages().list.side_effect = list_messages
-    people_service = Mock()
+    chat_service._http = _chat_http(
+        (400, {"error": {"code": 400, "message": "Invalid membership state"}})
+    )
 
-    with pytest.raises(TransientNetworkError, match="transient SSL error"):
-        await _unwrap(search_messages)(
-            chat_service=chat_service,
-            people_service=people_service,
-            user_google_email="test@example.com",
-            query="message",
+    result = await _find(chat_service, ["alice@example.com", "nobody@example.com"])
+
+    assert result == (
+        "Google Chat does not recognize at least one of users/alice@example.com, "
+        "users/nobody@example.com. Check the email addresses."
+    )
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._name_spaces", new_callable=AsyncMock)
+async def test_find_conversations_returns_group_chats(mock_name_spaces):
+    mock_name_spaces.return_value = {"spaces/GC": "Alice Smith, Bob Jones"}
+    chat_service = Mock()
+    chat_service._http = _chat_http(
+        (200, {"spaces": [{"name": "spaces/GC", "spaceType": "GROUP_CHAT"}]})
+    )
+
+    result = await _find(chat_service, ["alice@example.com", "users/300"])
+
+    assert _sent_requests(chat_service) == [
+        (
+            "GET",
+            "/v1/spaces:findGroupChats",
+            {
+                "users": ["users/alice@example.com", "users/300"],
+                "spaceView": ["SPACE_VIEW_EXPANDED"],
+                "pageSize": ["30"],
+                "alt": ["json"],
+            },
+            None,
         )
+    ]
+    assert "- Alice Smith, Bob Jones (GROUP_CHAT, ID: spaces/GC)" in result
+
+
+@pytest.mark.asyncio
+async def test_find_conversations_requires_a_participant():
+    from core.utils import UserInputError
+
+    with pytest.raises(UserInputError):
+        await _find(Mock(), ["", "  "])
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +642,28 @@ async def test_download_invalid_index():
 
     assert "Invalid attachment_index" in result
     assert "1 attachment(s)" in result
+
+
+@pytest.mark.asyncio
+async def test_download_points_drive_files_to_drive():
+    msg = _make_message(attachments=[_make_drive_attachment()])
+    service = Mock()
+    service.spaces().messages().get().execute.return_value = msg
+
+    from gchat.chat_tools import download_chat_attachment
+
+    with patch("gchat.chat_tools.httpx.AsyncClient") as mock_client:
+        result = await _unwrap(download_chat_attachment)(
+            service=service,
+            user_google_email="test@example.com",
+            message_id="spaces/S/messages/M",
+        )
+
+    mock_client.assert_not_called()
+    assert result == (
+        "Attachment 'Budget' is a Google Drive file, which Chat cannot download. "
+        "Read it with get_drive_file_content(file_id='FILE1')."
+    )
 
 
 @pytest.mark.asyncio
